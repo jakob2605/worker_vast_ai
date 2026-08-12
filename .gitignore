@@ -1,0 +1,20 @@
+# Never commit secrets - this repo is public
+.env
+*.key
+*.pem
+id_rsa*
+id_ed25519*
+
+# Runtime data - the whole point is that this stays on the box
+library/
+downloads/
+*.sqlite3
+*.mp4
+*.mkv
+*.npy
+*.jpg
+*.log
+
+__pycache__/
+*.pyc
+.venv/
