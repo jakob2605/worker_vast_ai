@@ -174,6 +174,7 @@ def jobs() -> dict[str, Any]:
     movies = db.list_movies()
     for movie in movies:
         movie["clip_count"] = db.count_clips({"movie_id": movie["id"]})
+        movie["downloadable_count"] = db.count_clips({"movie_id": movie["id"], "has_file": True})
         movie["indexed_count"] = db.count_clips({"movie_id": movie["id"], "status": "indexed"})
     return {"movies": movies}
 
