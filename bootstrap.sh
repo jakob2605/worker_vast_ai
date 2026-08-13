@@ -99,7 +99,7 @@ echo "python: $PY" | tee -a "$LOG"
   echo "FATAL: uvicorn/fastapi missing after install" | tee -a "$LOG"; exit 1;
 }
 
-python -c "import torch;print('torch',torch.__version__,'cuda',torch.cuda.is_available())" 2>&1 | tee -a "$LOG" || true
+"$PY" -c "import torch;print('torch',torch.__version__,'cuda',torch.cuda.is_available(),torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')" 2>&1 | tee -a "$LOG" || true
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>&1 | tee -a "$LOG" || true
 
 pkill -f "uvicorn worker:app" 2>/dev/null || true

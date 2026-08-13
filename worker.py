@@ -94,6 +94,47 @@ def health() -> dict[str, Any]:
     }
 
 
+@app.post("/update", dependencies=[Depends(auth)])
+def update() -> dict[str, Any]:
+    """
+    git pull, then restart this process so the new code takes effect.
+
+    Saves a stop/start cycle every time the pipeline changes. Settings live in
+    config.py and are read at import, so the re-exec picks them up.
+    """
+    worker_dir = Path(__file__).resolve().parent
+    result: dict[str, Any] = {"dir": str(worker_dir)}
+
+    pull = subprocess.run(
+        ["git", "-C", str(worker_dir), "pull", "--ff-only"],
+        capture_output=True, text=True, timeout=120,
+    )
+    result["pull_stdout"] = pull.stdout.strip()
+    result["pull_stderr"] = pull.stderr.strip()
+    result["pull_ok"] = pull.returncode == 0
+    if not result["pull_ok"]:
+        raise HTTPException(502, f"git pull failed: {pull.stderr.strip() or pull.stdout.strip()}")
+
+    result["head"] = subprocess.run(
+        ["git", "-C", str(worker_dir), "log", "-1", "--oneline"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    port = os.getenv("WORKER_PORT", "8100")
+
+    def restart() -> None:
+        time.sleep(0.5)  # let this response flush first
+        os.chdir(worker_dir)
+        os.execv(
+            sys.executable,
+            [sys.executable, "-m", "uvicorn", "worker:app", "--host", "0.0.0.0", "--port", port],
+        )
+
+    threading.Thread(target=restart, daemon=True).start()
+    result["restarting"] = True
+    return result
+
+
 @app.get("/gpu", dependencies=[Depends(auth)])
 def gpu_detail() -> dict[str, Any]:
     analyzer = SemanticAnalyzer()

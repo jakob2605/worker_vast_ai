@@ -43,7 +43,7 @@ DEVICE = detect_device()
 
 @dataclass(frozen=True)
 class ProcessingSettings:
-    min_clip_seconds: float = 2.0
+    min_clip_seconds: float = 0.0
     merge_tiny_shots_seconds: float = 0.8
     transnet_threshold: float = 0.5
     sample_frames_per_clip: int = 5
