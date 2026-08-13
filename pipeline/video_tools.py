@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+from html.parser import HTMLParser
+from http.cookiejar import CookieJar
 import json
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Callable
+from urllib.parse import urlencode, urljoin, urlparse
+import urllib.request
+
+
+CHUNK_SIZE = 4 * 1024 * 1024
+ProgressCallback = Callable[[int, int], None]
 
 
 class ToolMissingError(RuntimeError):
@@ -126,31 +135,99 @@ def export_clip(
     return "libx264"
 
 
-def download_movie(url: str, target: Path, progress: "callable | None" = None) -> Path:
+class _GoogleDriveConfirmParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.forms: list[tuple[str, dict[str, str]]] = []
+        self.links: list[str] = []
+        self._form_action: str | None = None
+        self._form_inputs: dict[str, str] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = {name: value or "" for name, value in attrs}
+        if tag == "form":
+            self._form_action = values.get("action", "")
+            self._form_inputs = {}
+        elif tag == "input" and self._form_action is not None:
+            name = values.get("name")
+            if name:
+                self._form_inputs[name] = values.get("value", "")
+        elif tag == "a":
+            href = values.get("href", "")
+            if href and "confirm=" in href and "download" in href:
+                self.links.append(href)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "form" and self._form_action is not None:
+            self.forms.append((self._form_action, dict(self._form_inputs)))
+            self._form_action = None
+            self._form_inputs = {}
+
+
+def _request(url: str, user_agent: str) -> urllib.request.Request:
+    return urllib.request.Request(url, headers={"User-Agent": user_agent})
+
+
+def _is_google_drive_url(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return host.endswith("drive.google.com") or host.endswith("drive.usercontent.google.com")
+
+
+def _google_drive_confirm_url(base_url: str, html: str) -> str | None:
+    parser = _GoogleDriveConfirmParser()
+    parser.feed(html)
+
+    for action, fields in parser.forms:
+        if "confirm" not in fields:
+            continue
+        if "download" not in action and "drive.usercontent.google.com" not in action:
+            continue
+        return urljoin(base_url, action) + "?" + urlencode(fields)
+
+    if parser.links:
+        return urljoin(base_url, parser.links[0])
+    return None
+
+
+def _stream_response(response, target: Path, progress: ProgressCallback | None = None) -> None:
+    total = int(response.headers.get("Content-Length") or 0)
+    done = 0
+    with target.open("wb") as handle:
+        while True:
+            chunk = response.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            handle.write(chunk)
+            done += len(chunk)
+            if progress:
+                progress(done, total)
+
+
+def download_movie(url: str, target: Path, progress: ProgressCallback | None = None) -> Path:
     """
     Stream a movie straight onto this machine. This is the whole point of running
     on a rented box: hundreds of GB arrive at datacenter bandwidth and never
     travel through the user's home connection.
     """
-    import urllib.request
-
     target.parent.mkdir(parents=True, exist_ok=True)
-    request = urllib.request.Request(url, headers={"User-Agent": "movie-clips-worker/1.0"})
-    with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310
-        total = int(response.headers.get("Content-Length") or 0)
-        done = 0
-        chunk_size = 4 * 1024 * 1024
-        with target.open("wb") as handle:
-            while True:
-                chunk = response.read(chunk_size)
-                if not chunk:
-                    break
-                handle.write(chunk)
-                done += len(chunk)
-                if progress:
-                    progress(done, total)
+    user_agent = "movie-clips-worker/1.0"
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()))
+
+    with opener.open(_request(url, user_agent), timeout=60) as response:  # noqa: S310
+        content_type = response.headers.get("Content-Type", "").lower()
+        if _is_google_drive_url(response.url) and "text/html" in content_type:
+            html = response.read(2 * 1024 * 1024).decode("utf-8", errors="replace")
+            confirm_url = _google_drive_confirm_url(response.url, html)
+            if not confirm_url:
+                raise RuntimeError("Google Drive returned a confirmation page, but no download confirmation link was found.")
+            with opener.open(_request(confirm_url, user_agent), timeout=60) as confirmed:  # noqa: S310
+                if "text/html" in confirmed.headers.get("Content-Type", "").lower():
+                    raise RuntimeError("Google Drive did not return the movie file after confirmation.")
+                _stream_response(confirmed, target, progress)
+        else:
+            _stream_response(response, target, progress)
+
     if target.stat().st_size == 0:
         target.unlink(missing_ok=True)
         raise RuntimeError(f"Downloaded 0 bytes from {url}")
     return target
-
