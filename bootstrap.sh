@@ -82,7 +82,10 @@ ls -l "$WORKER_DIR" | tee -a "$LOG"
 # a pip torch would likely be the CPU build and silently kill GPU throughput.
 if [ -f "$WORKER_DIR/requirements.txt" ]; then
   echo "installing python deps (this takes a few minutes)" | tee -a "$LOG"
-  if pip install --no-cache-dir -r "$WORKER_DIR/requirements.txt" >>"$LOG" 2>&1; then
+  REQ_NO_TRANSNET=/tmp/worker-requirements-no-transnet.txt
+  grep -v -E '^(transnetv2-pytorch|torch)([<=> ].*)?$' "$WORKER_DIR/requirements.txt" > "$REQ_NO_TRANSNET"
+  if pip install --no-cache-dir -r "$REQ_NO_TRANSNET" >>"$LOG" 2>&1 \
+      && pip install --no-cache-dir --no-deps transnetv2-pytorch >>"$LOG" 2>&1; then
     echo "deps installed" | tee -a "$LOG"
   else
     # Do not swallow this. A failed install is the most likely reason the

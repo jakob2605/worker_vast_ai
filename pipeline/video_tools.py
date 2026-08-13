@@ -86,6 +86,29 @@ def has_nvenc() -> bool:
         return False
 
 
+def nvenc_usable() -> bool:
+    """True when this container can actually open an NVENC encode session."""
+    try:
+        subprocess.check_call(
+            [
+                "ffmpeg", "-hide_banner",
+                "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30",
+                "-t", "1",
+                "-c:v", "h264_nvenc",
+                "-gpu", "0",
+                "-preset", "p5",
+                "-rc", "vbr",
+                "-cq", "21",
+                "-f", "null", "-",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def export_clip(
     source: Path,
     target: Path,
@@ -125,7 +148,7 @@ def export_clip(
         cmd += ["-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", str(target)]
         return cmd
 
-    if use_nvenc:
+    if use_nvenc and nvenc_usable():
         try:
             subprocess.check_call(build("h264_nvenc"))
             return "h264_nvenc"

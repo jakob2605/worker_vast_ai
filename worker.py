@@ -28,6 +28,7 @@ from pipeline import db  # noqa: E402
 from pipeline.config import (  # noqa: E402
     CLIPS_DIR,
     EMBEDDINGS_DIR,
+    FRAMES_DIR,
     LIBRARY_DIR,
     METADATA_DIR,
     MOVIES_DIR,
@@ -36,7 +37,7 @@ from pipeline.config import (  # noqa: E402
 )
 from pipeline.processor import ingest_url, pause_processing, start_processing  # noqa: E402
 from pipeline.semantics import SemanticAnalyzer  # noqa: E402
-from pipeline.video_tools import has_nvenc  # noqa: E402
+from pipeline.video_tools import has_nvenc, nvenc_usable  # noqa: E402
 
 TOKEN = os.getenv("WORKER_TOKEN", "")
 STARTED_AT = time.time()
@@ -81,6 +82,7 @@ def health() -> dict[str, Any]:
         "device": SETTINGS.device,
         "gpu": gpu,
         "nvenc": has_nvenc(),
+        "nvenc_usable": nvenc_usable(),
         "use_nvenc": SETTINGS.use_nvenc,
         "siglip_batch": SETTINGS.siglip_batch_size,
         "fp16": SETTINGS.siglip_fp16,
@@ -192,6 +194,43 @@ def pause_job(movie_id: int) -> dict[str, Any]:
         raise HTTPException(404, "Movie not found")
     pause_processing(movie_id)
     return {"movie": db.get_movie(movie_id)}
+
+
+@app.delete("/jobs/{movie_id}", dependencies=[Depends(auth)])
+def delete_job(movie_id: int) -> dict[str, Any]:
+    movie = db.get_movie(movie_id)
+    if not movie:
+        raise HTTPException(404, "Movie not found")
+    active = {
+        "queued",
+        "downloading",
+        "detecting_shots",
+        "exporting_clips",
+        "motion_analysis",
+        "semantic_indexing",
+        "metadata_export",
+    }
+    if movie.get("progress_stage") in active:
+        raise HTTPException(409, "Pause the job before deleting it.")
+
+    removed = 0
+    for clip in db.list_clips({"movie_id": movie_id}):
+        for key in ("clip_path", "metadata_path", "embedding_path"):
+            value = clip.get(key)
+            if value and Path(value).exists():
+                Path(value).unlink(missing_ok=True)
+                removed += 1
+        frame_dir = FRAMES_DIR / f"clip_{int(clip['id']):06d}"
+        if frame_dir.exists():
+            shutil.rmtree(frame_dir, ignore_errors=True)
+            removed += 1
+
+    source = Path(movie["path"])
+    if source.exists():
+        source.unlink(missing_ok=True)
+        removed += 1
+    db.delete_movie(movie_id)
+    return {"deleted": True, "files_removed": removed}
 
 
 # --------------------------------------------------------------------------

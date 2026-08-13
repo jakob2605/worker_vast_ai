@@ -238,6 +238,11 @@ def delete_clips(clip_ids: list[int]) -> list[dict[str, Any]]:
     return clips
 
 
+def delete_movie(movie_id: int) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM movies WHERE id = ?", (movie_id,))
+
+
 def _clip_where(filters: dict[str, Any] | None = None) -> tuple[list[str], list[Any]]:
     filters = filters or {}
     where: list[str] = []
