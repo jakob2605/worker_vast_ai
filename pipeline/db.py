@@ -48,6 +48,8 @@ def init_db() -> None:
                 error TEXT,
                 detector TEXT,
                 source_url TEXT DEFAULT '',
+                encoder TEXT DEFAULT '',
+                device TEXT DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -81,6 +83,7 @@ def init_db() -> None:
                 description TEXT NOT NULL DEFAULT '',
                 tags TEXT NOT NULL DEFAULT '[]',
                 user_notes TEXT NOT NULL DEFAULT '',
+                downloaded_at TEXT DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(movie_id, clip_index)
@@ -235,7 +238,7 @@ def delete_clips(clip_ids: list[int]) -> list[dict[str, Any]]:
     return clips
 
 
-def list_clips(filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+def _clip_where(filters: dict[str, Any] | None = None) -> tuple[list[str], list[Any]]:
     filters = filters or {}
     where: list[str] = []
     values: list[Any] = []
@@ -261,36 +264,66 @@ def list_clips(filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     if filters.get("shot_size"):
         where.append("shot_size = ?")
         values.append(filters["shot_size"])
+    if filters.get("status"):
+        where.append("status = ?")
+        values.append(filters["status"])
+    if filters.get("has_file"):
+        where.append("clip_path IS NOT NULL AND clip_path != ''")
+    text = (filters.get("text") or "").strip().lower()
+    if text:
+        text_like = f"%{text}%"
+        where.append(
+            """
+            (
+                LOWER(description) LIKE ?
+                OR LOWER(user_notes) LIKE ?
+                OR LOWER(tags) LIKE ?
+                OR LOWER(moods) LIKE ?
+                OR LOWER(settings) LIKE ?
+            )
+            """
+        )
+        values.extend([text_like] * 5)
+    mood = (filters.get("mood") or "").strip().lower()
+    if mood:
+        where.append("LOWER(moods) LIKE ?")
+        values.append(f'%"{mood}"%')
+    tag = (filters.get("tag") or "").strip().lower()
+    if tag:
+        where.append("LOWER(tags) LIKE ?")
+        values.append(f'%"{tag}"%')
+
+    return where, values
+
+
+def count_clips(filters: dict[str, Any] | None = None) -> int:
+    where, values = _clip_where(filters)
+    sql = "SELECT COUNT(*) AS count FROM clips"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+
+    with connect() as conn:
+        row = conn.execute(sql, values).fetchone()
+    return int(row["count"] if row else 0)
+
+
+def list_clips(
+    filters: dict[str, Any] | None = None,
+    *,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    where, values = _clip_where(filters)
 
     sql = "SELECT * FROM clips"
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY movie_id DESC, start_time ASC"
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        values.extend([max(0, int(limit)), max(0, int(offset))])
 
     with connect() as conn:
         rows = conn.execute(sql, values).fetchall()
 
-    clips = [row_to_dict(row) for row in rows if row is not None]
-    text = (filters.get("text") or "").strip().lower()
-    mood = (filters.get("mood") or "").strip().lower()
-    tag = (filters.get("tag") or "").strip().lower()
-
-    if text:
-        clips = [
-            clip
-            for clip in clips
-            if text in " ".join(
-                [
-                    clip.get("description", ""),
-                    clip.get("user_notes", ""),
-                    " ".join(clip.get("tags", [])),
-                    " ".join(clip.get("moods", [])),
-                    " ".join(clip.get("settings", [])),
-                ]
-            ).lower()
-        ]
-    if mood:
-        clips = [clip for clip in clips if mood in [m.lower() for m in clip.get("moods", [])]]
-    if tag:
-        clips = [clip for clip in clips if tag in [t.lower() for t in clip.get("tags", [])]]
-    return clips
+    return [row_to_dict(row) for row in rows if row is not None]

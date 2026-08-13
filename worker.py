@@ -173,9 +173,8 @@ def create_jobs(req: IngestReq) -> dict[str, Any]:
 def jobs() -> dict[str, Any]:
     movies = db.list_movies()
     for movie in movies:
-        clips = db.list_clips({"movie_id": movie["id"]})
-        movie["clip_count"] = len(clips)
-        movie["indexed_count"] = sum(1 for c in clips if c.get("status") == "indexed")
+        movie["clip_count"] = db.count_clips({"movie_id": movie["id"]})
+        movie["indexed_count"] = db.count_clips({"movie_id": movie["id"], "status": "indexed"})
     return {"movies": movies}
 
 
@@ -201,21 +200,34 @@ def clips(
     text: Optional[str] = None,
     shot_size: Optional[str] = None,
     camera_motion_type: Optional[str] = None,
+    animation_motion_bucket: Optional[str] = None,
     mood: Optional[str] = None,
+    people_count: Optional[str] = None,
+    tag: Optional[str] = None,
     min_duration: Optional[float] = None,
     max_duration: Optional[float] = None,
+    has_file: bool = False,
+    limit: Optional[int] = None,
+    offset: int = 0,
 ) -> dict[str, Any]:
-    rows = db.list_clips(
-        {
-            "movie_id": movie_id, "text": text, "shot_size": shot_size,
-            "camera_motion_type": camera_motion_type, "mood": mood,
-            "min_duration": min_duration, "max_duration": max_duration,
-        }
-    )
+    filters = {
+        "movie_id": movie_id,
+        "text": text,
+        "shot_size": shot_size,
+        "camera_motion_type": camera_motion_type,
+        "animation_motion_bucket": animation_motion_bucket,
+        "mood": mood,
+        "people_count": people_count,
+        "tag": tag,
+        "min_duration": min_duration,
+        "max_duration": max_duration,
+        "has_file": has_file,
+    }
+    rows = db.list_clips(filters, limit=limit, offset=offset)
     for row in rows:
         path = row.get("clip_path")
         row["size_mb"] = round(Path(path).stat().st_size / 1048576, 2) if path and Path(path).exists() else None
-    return {"clips": rows, "count": len(rows)}
+    return {"clips": rows, "count": db.count_clips(filters)}
 
 
 @app.get("/clips/{clip_id}/file", dependencies=[Depends(auth)])
