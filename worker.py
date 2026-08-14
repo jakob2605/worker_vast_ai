@@ -37,7 +37,15 @@ from pipeline.config import (  # noqa: E402
     SETTINGS,
     ensure_library_dirs,
 )
-from pipeline.processor import ingest_url, pause_processing, record_source_link, start_processing  # noqa: E402
+from pipeline.processor import (  # noqa: E402
+    ingest_url,
+    is_processing,
+    pause_processing,
+    record_source_link,
+    reset_processing_outputs,
+    start_semantics_only,
+    start_processing,
+)
 from pipeline.semantics import SemanticAnalyzer  # noqa: E402
 from pipeline.video_tools import ffprobe, file_sha256, has_nvenc, nvenc_usable  # noqa: E402
 
@@ -320,6 +328,7 @@ class IngestReq(BaseModel):
     urls: list[str]
     movie_name: str
     autostart: bool = True
+    allow_reprocess: bool = False
 
 
 @app.post("/jobs", dependencies=[Depends(auth)])
@@ -335,6 +344,26 @@ def create_jobs(req: IngestReq) -> dict[str, Any]:
     for index, url in enumerate(urls, start=1):
         original_name = movie_name if len(urls) == 1 else f"{movie_name} {index}"
         holder: dict[str, Any] = {"url": url, "original_name": original_name}
+        existing = db.find_movie_by_source_url(url)
+        if existing:
+            holder["duplicate_movie_id"] = existing["id"]
+            holder["duplicate_of"] = existing["original_name"]
+            if not req.allow_reprocess:
+                holder["error"] = "Duplicate source URL. Enable reprocess existing movie to restart it."
+                accepted.append(holder)
+                continue
+            if is_processing(int(existing["id"])):
+                holder["error"] = "Existing movie is currently running. Pause or wait before reprocessing it."
+                accepted.append(holder)
+                continue
+            cleanup = reset_processing_outputs(int(existing["id"]))
+            holder["movie_id"] = existing["id"]
+            holder["reprocessed_existing"] = True
+            holder.update(cleanup)
+            if req.autostart:
+                start_processing(int(existing["id"]))
+            accepted.append(holder)
+            continue
 
         def run(u: str = url, name: str = original_name, h: dict[str, Any] = holder) -> None:
             try:
@@ -356,6 +385,7 @@ def jobs() -> dict[str, Any]:
     for movie in movies:
         movie["clip_count"] = db.count_clips({"movie_id": movie["id"]})
         movie["downloadable_count"] = db.count_clips({"movie_id": movie["id"], "has_file": True})
+        movie["motion_count"] = db.count_clips({"movie_id": movie["id"], "status": "motion_analyzed"})
         movie["indexed_count"] = db.count_clips({"movie_id": movie["id"], "status": "indexed"})
     return {"movies": movies}
 
@@ -369,6 +399,7 @@ def titles() -> dict[str, Any]:
 async def upload_jobs(
     title: str = Form(...),
     autostart: bool = Form(True),
+    allow_reprocess: bool = Form(False),
     files: list[UploadFile] = File(...),
 ) -> dict[str, Any]:
     collection_title = title.strip()
@@ -393,11 +424,39 @@ async def upload_jobs(
                 while chunk := await file.read(1024 * 1024):
                     handle.write(chunk)
             info = ffprobe(target)
+            checksum = file_sha256(target)
+            existing = db.find_movie_by_checksum(checksum)
+            if existing:
+                target.unlink(missing_ok=True)
+                item = {
+                    "original_name": original_name,
+                    "duplicate_movie_id": existing["id"],
+                    "duplicate_of": existing["original_name"],
+                }
+                if not allow_reprocess:
+                    item["error"] = "Duplicate file. Enable reprocess existing movie to restart it."
+                    accepted.append(item)
+                    continue
+                if is_processing(int(existing["id"])):
+                    item["error"] = "Existing movie is currently running. Pause or wait before reprocessing it."
+                    accepted.append(item)
+                    continue
+                cleanup = reset_processing_outputs(int(existing["id"]))
+                db.update_movie(int(existing["id"]), collection_title=collection_title)
+                if autostart:
+                    start_processing(int(existing["id"]))
+                accepted.append({
+                    **item,
+                    **cleanup,
+                    "movie_id": existing["id"],
+                    "reprocessed_existing": True,
+                })
+                continue
             movie_id = db.create_movie(
                 original_name=original_name,
                 filename=filename,
                 path=target,
-                checksum=file_sha256(target),
+                checksum=checksum,
                 duration=float(info["duration"]),
                 fps=float(info["fps"]),
                 width=int(info["width"]),
@@ -427,9 +486,15 @@ async def upload_jobs(
 
 @app.post("/jobs/{movie_id}/start", dependencies=[Depends(auth)])
 def start_job(movie_id: int) -> dict[str, Any]:
-    if not db.get_movie(movie_id):
+    movie = db.get_movie(movie_id)
+    if not movie:
         raise HTTPException(404, "Movie not found")
-    return {"started": start_processing(movie_id), "movie": db.get_movie(movie_id)}
+    if is_processing(movie_id):
+        return {"started": False, "movie": movie, "message": "Movie is already running."}
+    cleanup: dict[str, int] | None = None
+    if not movie.get("paused") and db.count_clips({"movie_id": movie_id}) > 0:
+        cleanup = reset_processing_outputs(movie_id)
+    return {"started": start_processing(movie_id), "movie": db.get_movie(movie_id), "cleanup": cleanup}
 
 
 @app.post("/jobs/{movie_id}/pause", dependencies=[Depends(auth)])
@@ -438,6 +503,18 @@ def pause_job(movie_id: int) -> dict[str, Any]:
         raise HTTPException(404, "Movie not found")
     pause_processing(movie_id)
     return {"movie": db.get_movie(movie_id)}
+
+
+@app.post("/jobs/{movie_id}/semantics", dependencies=[Depends(auth)])
+def rerun_semantics_job(movie_id: int) -> dict[str, Any]:
+    movie = db.get_movie(movie_id)
+    if not movie:
+        raise HTTPException(404, "Movie not found")
+    if is_processing(movie_id):
+        return {"started": False, "movie": movie, "message": "Movie is already running."}
+    if db.count_clips({"movie_id": movie_id}) == 0:
+        raise HTTPException(409, "No clips exist yet. Run the full job first.")
+    return {"started": start_semantics_only(movie_id), "movie": db.get_movie(movie_id)}
 
 
 @app.delete("/jobs/{movie_id}", dependencies=[Depends(auth)])
@@ -457,24 +534,9 @@ def delete_job(movie_id: int) -> dict[str, Any]:
     if movie.get("progress_stage") in active:
         raise HTTPException(409, "Pause the job before deleting it.")
 
-    removed = 0
-    for clip in db.list_clips({"movie_id": movie_id}):
-        for key in ("clip_path", "metadata_path", "embedding_path"):
-            value = clip.get(key)
-            if value and Path(value).exists():
-                Path(value).unlink(missing_ok=True)
-                removed += 1
-        frame_dir = FRAMES_DIR / f"clip_{int(clip['id']):06d}"
-        if frame_dir.exists():
-            shutil.rmtree(frame_dir, ignore_errors=True)
-            removed += 1
-
-    source = Path(movie["path"])
-    if source.exists():
-        source.unlink(missing_ok=True)
-        removed += 1
+    cleanup = reset_processing_outputs(movie_id, delete_source=True)
     db.delete_movie(movie_id)
-    return {"deleted": True, "files_removed": removed}
+    return {"deleted": True, **cleanup}
 
 
 # --------------------------------------------------------------------------
@@ -556,8 +618,6 @@ def bundle(req: BundleReq) -> FileResponse:
                 if path.is_file():
                     zf.write(path, f"{label}/{path.relative_to(folder)}")
         if req.include_frames:
-            from pipeline.config import FRAMES_DIR
-
             for path in FRAMES_DIR.rglob("*.jpg"):
                 zf.write(path, f"frames/{path.relative_to(FRAMES_DIR)}")
     return FileResponse(out, media_type="application/zip", filename="library_bundle.zip")

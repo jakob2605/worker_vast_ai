@@ -177,6 +177,31 @@ def get_movie(movie_id: int) -> dict[str, Any] | None:
         return row_to_dict(conn.execute("SELECT * FROM movies WHERE id = ?", (movie_id,)).fetchone())
 
 
+def find_movie_by_checksum(checksum: str, *, exclude_id: int | None = None) -> dict[str, Any] | None:
+    if not checksum:
+        return None
+    sql = "SELECT * FROM movies WHERE checksum = ?"
+    values: list[Any] = [checksum]
+    if exclude_id is not None:
+        sql += " AND id != ?"
+        values.append(exclude_id)
+    sql += " ORDER BY id DESC LIMIT 1"
+    with connect() as conn:
+        return row_to_dict(conn.execute(sql, values).fetchone())
+
+
+def find_movie_by_source_url(source_url: str) -> dict[str, Any] | None:
+    if not source_url:
+        return None
+    with connect() as conn:
+        return row_to_dict(
+            conn.execute(
+                "SELECT * FROM movies WHERE source_url = ? ORDER BY id DESC LIMIT 1",
+                (source_url,),
+            ).fetchone()
+        )
+
+
 def list_movies() -> list[dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute("SELECT * FROM movies ORDER BY created_at DESC").fetchall()
@@ -252,6 +277,11 @@ def delete_clips(clip_ids: list[int]) -> list[dict[str, Any]]:
         clips = [row_to_dict(row) for row in rows if row is not None]
         conn.execute(f"DELETE FROM clips WHERE id IN ({placeholders})", clip_ids)
     return clips
+
+
+def delete_clips_for_movie(movie_id: int) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM clips WHERE movie_id = ?", (movie_id,))
 
 
 def delete_movie(movie_id: int) -> None:

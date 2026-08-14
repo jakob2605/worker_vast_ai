@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import threading
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import uuid
 from urllib.parse import unquote, urlparse
 
 from . import db
-from .config import CLIPS_DIR, DOWNLOAD_LINKS_PATH, METADATA_DIR, MOVIES_DIR, SETTINGS, ensure_library_dirs
+from .config import CLIPS_DIR, DOWNLOAD_LINKS_PATH, FRAMES_DIR, METADATA_DIR, MOVIES_DIR, SETTINGS, ensure_library_dirs
 from .motion import analyze_motion
 from .semantics import SemanticAnalyzer
 from .shot_detection import Shot, detect_shots
@@ -115,8 +116,126 @@ def start_processing(movie_id: int) -> bool:
         return True
 
 
+def start_semantics_only(movie_id: int) -> bool:
+    with _job_lock:
+        thread = _running_jobs.get(movie_id)
+        if thread and thread.is_alive():
+            return False
+        db.update_movie(movie_id, paused=0, status="processing", progress_stage="semantic_indexing", error=None)
+        thread = threading.Thread(target=process_semantics_only, args=(movie_id,), daemon=True)
+        _running_jobs[movie_id] = thread
+        thread.start()
+        return True
+
+
+def is_processing(movie_id: int) -> bool:
+    with _job_lock:
+        thread = _running_jobs.get(movie_id)
+        return bool(thread and thread.is_alive())
+
+
 def pause_processing(movie_id: int) -> None:
     db.update_movie(movie_id, paused=1, status="paused", progress_stage="paused")
+
+
+def reset_processing_outputs(movie_id: int, *, delete_source: bool = False) -> dict[str, int]:
+    movie = db.get_movie(movie_id)
+    if not movie:
+        raise ValueError("Movie not found")
+
+    removed = 0
+    clips = db.list_clips({"movie_id": movie_id})
+    for clip in clips:
+        for key in ("clip_path", "metadata_path", "embedding_path"):
+            value = clip.get(key)
+            if value:
+                path = Path(value)
+                if path.exists():
+                    path.unlink(missing_ok=True)
+                    removed += 1
+        frame_dir = FRAMES_DIR / f"clip_{int(clip['id']):06d}"
+        if frame_dir.exists():
+            shutil.rmtree(frame_dir, ignore_errors=True)
+            removed += 1
+
+    folder_name = _movie_folder_name(movie_id, movie["original_name"])
+    for folder in (CLIPS_DIR / folder_name, METADATA_DIR / folder_name):
+        if folder.exists():
+            shutil.rmtree(folder, ignore_errors=True)
+            removed += 1
+
+    if delete_source:
+        source = Path(movie["path"])
+        if source.exists():
+            source.unlink(missing_ok=True)
+            removed += 1
+
+    db.delete_clips_for_movie(movie_id)
+    if not delete_source:
+        db.update_movie(
+            movie_id,
+            paused=0,
+            status="imported",
+            progress_stage="imported",
+            progress_detail="Ready to process",
+            error=None,
+            detector=None,
+            encoder="",
+            device="",
+        )
+    return {"files_removed": removed, "clips_removed": len(clips)}
+
+
+def reset_semantic_outputs(movie_id: int) -> dict[str, int]:
+    movie = db.get_movie(movie_id)
+    if not movie:
+        raise ValueError("Movie not found")
+
+    removed = 0
+    clips = db.list_clips({"movie_id": movie_id})
+    for clip in clips:
+        for key in ("metadata_path", "embedding_path"):
+            value = clip.get(key)
+            if value:
+                path = Path(value)
+                if path.exists():
+                    path.unlink(missing_ok=True)
+                    removed += 1
+        frame_dir = FRAMES_DIR / f"clip_{int(clip['id']):06d}"
+        if frame_dir.exists():
+            shutil.rmtree(frame_dir, ignore_errors=True)
+            removed += 1
+
+        if clip["status"] != "too_short":
+            db.update_clip(
+                int(clip["id"]),
+                status="motion_analyzed" if clip.get("clip_path") else "detected",
+                people_count="unknown",
+                shot_size="unknown",
+                moods=[],
+                settings=[],
+                quality_flags=[],
+                description="",
+                tags=[],
+                embedding_path="",
+                metadata_path="",
+            )
+
+    folder_name = _movie_folder_name(movie_id, movie["original_name"])
+    metadata_dir = METADATA_DIR / folder_name
+    if metadata_dir.exists():
+        shutil.rmtree(metadata_dir, ignore_errors=True)
+        removed += 1
+
+    db.update_movie(
+        movie_id,
+        paused=0,
+        status="processing",
+        progress_stage="semantic_indexing",
+        progress_detail="Creating semantic labels and embeddings",
+        error=None,
+    )
+    return {"files_removed": removed, "clips_reset": sum(1 for clip in clips if clip["status"] != "too_short")}
 
 
 def process_movie(movie_id: int) -> None:
@@ -160,6 +279,31 @@ def process_movie(movie_id: int) -> None:
     except ToolMissingError as exc:
         db.update_movie(movie_id, status="error", progress_stage="error", error=str(exc))
     except Exception as exc:
+        db.update_movie(movie_id, status="error", progress_stage="error", error=repr(exc))
+    finally:
+        with _job_lock:
+            _running_jobs.pop(movie_id, None)
+
+
+def process_semantics_only(movie_id: int) -> None:
+    movie = db.get_movie(movie_id)
+    if not movie:
+        return
+
+    try:
+        source = Path(movie["path"])
+        if not source.exists():
+            raise FileNotFoundError(f"Source movie is missing: {source}")
+        reset_semantic_outputs(movie_id)
+        if _is_paused(movie_id):
+            return
+        _analyze_missing_semantics(movie_id, source)
+        if _is_paused(movie_id):
+            return
+        db.update_movie(movie_id, progress_stage="metadata_export", progress_detail="Writing metadata sidecars")
+        _write_all_metadata(movie_id)
+        db.update_movie(movie_id, status="complete", progress_stage="complete", progress_detail="Semantics refreshed", error=None)
+    except Exception as exc:  # noqa: BLE001
         db.update_movie(movie_id, status="error", progress_stage="error", error=repr(exc))
     finally:
         with _job_lock:
