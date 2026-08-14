@@ -9,7 +9,7 @@ import uuid
 from urllib.parse import unquote, urlparse
 
 from . import db
-from .config import CLIPS_DIR, METADATA_DIR, MOVIES_DIR, SETTINGS, ensure_library_dirs
+from .config import CLIPS_DIR, DOWNLOAD_LINKS_PATH, METADATA_DIR, MOVIES_DIR, SETTINGS, ensure_library_dirs
 from .motion import analyze_motion
 from .semantics import SemanticAnalyzer
 from .shot_detection import Shot, detect_shots
@@ -18,9 +18,10 @@ from .video_tools import ToolMissingError, download_movie, export_clip, ffprobe,
 
 _job_lock = threading.Lock()
 _running_jobs: dict[int, threading.Thread] = {}
+_download_link_lock = threading.Lock()
 
 
-def ingest_url(url: str, original_name: str | None = None) -> int:
+def ingest_url(url: str, original_name: str | None = None, collection_title: str = "") -> int:
     """
     Download a movie onto this box and register it, replacing the browser-upload
     path from the local app. Returns the new movie id.
@@ -40,7 +41,9 @@ def ingest_url(url: str, original_name: str | None = None) -> int:
         fps=0.0,
         width=0,
         height=0,
+        collection_title=collection_title,
     )
+    record_source_link(movie_id, parsed_name, collection_title, url, target, source_type="url")
     db.update_movie(
         movie_id, status="downloading", progress_stage="downloading",
         progress_detail=f"Fetching {parsed_name}", source_url=url,
@@ -74,6 +77,30 @@ def ingest_url(url: str, original_name: str | None = None) -> int:
         db.update_movie(movie_id, status="error", progress_stage="error", error=f"Download failed: {exc}")
         raise
     return movie_id
+
+
+def record_source_link(
+    movie_id: int,
+    original_name: str,
+    collection_title: str,
+    source_url: str,
+    target: Path,
+    *,
+    source_type: str,
+) -> None:
+    entry = {
+        "movie_id": movie_id,
+        "original_name": original_name,
+        "collection_title": collection_title,
+        "source_url": source_url,
+        "source_type": source_type,
+        "target": str(target),
+        "created_at": db.utc_now(),
+    }
+    with _download_link_lock:
+        DOWNLOAD_LINKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with DOWNLOAD_LINKS_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=True) + "\n")
 
 
 def start_processing(movie_id: int) -> bool:

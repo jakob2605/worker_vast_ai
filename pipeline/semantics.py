@@ -33,6 +33,7 @@ class SemanticAnalyzer:
         self._torch: Any = None
         self._device: str = SETTINGS.device
         self._dtype: Any = None
+        self._last_error = ""
 
     def analyze_clip(self, video_path: Path, clip_id: int, start_time: float, end_time: float) -> dict[str, Any]:
         frames = sample_frames(video_path, start_time, end_time, SETTINGS.sample_frames_per_clip, 384)
@@ -42,8 +43,8 @@ class SemanticAnalyzer:
         if self._ensure_model():
             try:
                 return self._siglip_result(frames, clip_id, frame_paths)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                self._last_error = f"SigLIP inference failed: {type(exc).__name__}: {exc}"
         return self._fallback_result(frames, clip_id, frame_paths)
 
     def _ensure_model(self) -> bool:
@@ -63,8 +64,10 @@ class SemanticAnalyzer:
             self._model = model.to(self._device)
             self._model.eval()
             self._available = True
-        except Exception:
+            self._last_error = ""
+        except Exception as exc:  # noqa: BLE001
             self._available = False
+            self._last_error = f"SigLIP unavailable: {type(exc).__name__}: {exc}"
         return self._available
 
     def device_info(self) -> dict[str, Any]:
@@ -75,6 +78,7 @@ class SemanticAnalyzer:
             "device": getattr(self, "_device", SETTINGS.device),
             "fp16": SETTINGS.siglip_fp16,
             "batch_size": SETTINGS.siglip_batch_size,
+            "error": self._last_error,
         }
 
     def _siglip_result(self, frames: list[np.ndarray], clip_id: int, frame_paths: list[str]) -> dict[str, Any]:
@@ -130,9 +134,15 @@ class SemanticAnalyzer:
         tags = [shot_size, *moods, "low_confidence"]
         if "low_confidence" not in quality:
             quality.append("low_confidence")
+        if "siglip_unavailable" not in quality:
+            quality.append("siglip_unavailable")
         embedding_path = EMBEDDINGS_DIR / f"clip_{clip_id:06d}.json"
         embedding_path.parent.mkdir(parents=True, exist_ok=True)
-        embedding_path.write_text(json.dumps({"fallback": True, "brightness": brightness}), encoding="utf-8")
+        embedding_path.write_text(
+            json.dumps({"fallback": True, "brightness": brightness, "error": self._last_error}),
+            encoding="utf-8",
+        )
+        description = self._last_error or "Fallback visual analysis; SigLIP2 semantic model was unavailable."
         return {
             "people_count": "unknown",
             "shot_size": shot_size,
@@ -140,7 +150,7 @@ class SemanticAnalyzer:
             "settings": [],
             "quality_flags": quality,
             "tags": tags,
-            "description": "Fallback visual analysis; install SigLIP2 dependencies for semantic labels.",
+            "description": description,
             "embedding_path": str(embedding_path),
             "frame_paths": frame_paths,
             "semantic_model": "fallback-cv",

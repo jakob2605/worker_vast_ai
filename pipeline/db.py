@@ -48,6 +48,7 @@ def init_db() -> None:
                 error TEXT,
                 detector TEXT,
                 source_url TEXT DEFAULT '',
+                collection_title TEXT DEFAULT '',
                 encoder TEXT DEFAULT '',
                 device TEXT DEFAULT '',
                 created_at TEXT NOT NULL,
@@ -104,6 +105,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     added = {
         "movies": {
             "source_url": "TEXT DEFAULT ''",
+            "collection_title": "TEXT DEFAULT ''",
             "encoder": "TEXT DEFAULT ''",
             "device": "TEXT DEFAULT ''",
         },
@@ -145,16 +147,17 @@ def create_movie(
     fps: float,
     width: int,
     height: int,
+    collection_title: str = "",
 ) -> int:
     now = utc_now()
     with connect() as conn:
         cur = conn.execute(
             """
             INSERT INTO movies
-                (original_name, filename, path, checksum, duration, fps, width, height, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (original_name, filename, path, checksum, duration, fps, width, height, collection_title, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (original_name, filename, str(path), checksum, duration, fps, width, height, now, now),
+            (original_name, filename, str(path), checksum, duration, fps, width, height, collection_title, now, now),
         )
         return int(cur.lastrowid)
 
@@ -178,6 +181,19 @@ def list_movies() -> list[dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute("SELECT * FROM movies ORDER BY created_at DESC").fetchall()
     return [row_to_dict(row) for row in rows if row is not None]
+
+
+def list_collection_titles() -> list[str]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT collection_title
+            FROM movies
+            WHERE collection_title IS NOT NULL AND collection_title != ''
+            ORDER BY collection_title COLLATE NOCASE
+            """
+        ).fetchall()
+    return [str(row["collection_title"]) for row in rows]
 
 
 def upsert_clip(movie_id: int, clip_index: int, **fields: Any) -> int:
@@ -251,6 +267,9 @@ def _clip_where(filters: dict[str, Any] | None = None) -> tuple[list[str], list[
     if filters.get("movie_id"):
         where.append("movie_id = ?")
         values.append(filters["movie_id"])
+    if filters.get("collection_title"):
+        where.append("movies.collection_title = ?")
+        values.append(filters["collection_title"])
     if filters.get("min_duration") is not None:
         where.append("duration >= ?")
         values.append(float(filters["min_duration"]))
@@ -303,7 +322,7 @@ def _clip_where(filters: dict[str, Any] | None = None) -> tuple[list[str], list[
 
 def count_clips(filters: dict[str, Any] | None = None) -> int:
     where, values = _clip_where(filters)
-    sql = "SELECT COUNT(*) AS count FROM clips"
+    sql = "SELECT COUNT(*) AS count FROM clips LEFT JOIN movies ON movies.id = clips.movie_id"
     if where:
         sql += " WHERE " + " AND ".join(where)
 
@@ -320,7 +339,12 @@ def list_clips(
 ) -> list[dict[str, Any]]:
     where, values = _clip_where(filters)
 
-    sql = "SELECT * FROM clips"
+    sql = """
+        SELECT clips.*, movies.collection_title AS collection_title,
+               movies.original_name AS movie_original_name
+        FROM clips
+        LEFT JOIN movies ON movies.id = clips.movie_id
+    """
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY movie_id DESC, start_time ASC"
