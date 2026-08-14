@@ -265,56 +265,56 @@ def _clip_where(filters: dict[str, Any] | None = None) -> tuple[list[str], list[
     values: list[Any] = []
 
     if filters.get("movie_id"):
-        where.append("movie_id = ?")
+        where.append("clips.movie_id = ?")
         values.append(filters["movie_id"])
     if filters.get("collection_title"):
         where.append("movies.collection_title = ?")
         values.append(filters["collection_title"])
     if filters.get("min_duration") is not None:
-        where.append("duration >= ?")
+        where.append("clips.duration >= ?")
         values.append(float(filters["min_duration"]))
     if filters.get("max_duration") is not None:
-        where.append("duration <= ?")
+        where.append("clips.duration <= ?")
         values.append(float(filters["max_duration"]))
     if filters.get("camera_motion_type"):
-        where.append("camera_motion_type = ?")
+        where.append("clips.camera_motion_type = ?")
         values.append(filters["camera_motion_type"])
     if filters.get("animation_motion_bucket"):
-        where.append("animation_motion_bucket = ?")
+        where.append("clips.animation_motion_bucket = ?")
         values.append(filters["animation_motion_bucket"])
     if filters.get("people_count"):
-        where.append("people_count = ?")
+        where.append("clips.people_count = ?")
         values.append(filters["people_count"])
     if filters.get("shot_size"):
-        where.append("shot_size = ?")
+        where.append("clips.shot_size = ?")
         values.append(filters["shot_size"])
     if filters.get("status"):
-        where.append("status = ?")
+        where.append("clips.status = ?")
         values.append(filters["status"])
     if filters.get("has_file"):
-        where.append("clip_path IS NOT NULL AND clip_path != ''")
+        where.append("clips.clip_path IS NOT NULL AND clips.clip_path != ''")
     text = (filters.get("text") or "").strip().lower()
     if text:
         text_like = f"%{text}%"
         where.append(
             """
             (
-                LOWER(description) LIKE ?
-                OR LOWER(user_notes) LIKE ?
-                OR LOWER(tags) LIKE ?
-                OR LOWER(moods) LIKE ?
-                OR LOWER(settings) LIKE ?
+                LOWER(clips.description) LIKE ?
+                OR LOWER(clips.user_notes) LIKE ?
+                OR LOWER(clips.tags) LIKE ?
+                OR LOWER(clips.moods) LIKE ?
+                OR LOWER(clips.settings) LIKE ?
             )
             """
         )
         values.extend([text_like] * 5)
     mood = (filters.get("mood") or "").strip().lower()
     if mood:
-        where.append("LOWER(moods) LIKE ?")
+        where.append("LOWER(clips.moods) LIKE ?")
         values.append(f'%"{mood}"%')
     tag = (filters.get("tag") or "").strip().lower()
     if tag:
-        where.append("LOWER(tags) LIKE ?")
+        where.append("LOWER(clips.tags) LIKE ?")
         values.append(f'%"{tag}"%')
 
     return where, values
@@ -347,7 +347,7 @@ def list_clips(
     """
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY movie_id DESC, start_time ASC"
+    sql += " ORDER BY clips.movie_id DESC, clips.start_time ASC"
     if limit is not None:
         sql += " LIMIT ? OFFSET ?"
         values.extend([max(0, int(limit)), max(0, int(offset))])
