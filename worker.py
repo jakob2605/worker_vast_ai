@@ -206,6 +206,102 @@ class SemanticMatchReq(BaseModel):
     limit: int = 80
 
 
+class CatalogReq(BaseModel):
+    filter_query: str = ""
+    text: str = ""
+    profile_id: str = ""
+    limit: int = 10000
+    offset: int = 0
+
+
+def _facet_counts(rows: list[dict[str, Any]], field: str, *, many: bool = False) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        values = (row.get(field) or []) if many else [row.get(field)]
+        if not isinstance(values, list):
+            values = [values]
+        for value in values:
+            label = str(value or "").strip()
+            if label and label != "unknown":
+                counts[label] = counts.get(label, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0].lower())))
+
+
+def _catalog(req: CatalogReq) -> dict[str, Any]:
+    filters = {
+        "filter_query": req.filter_query,
+        "text": req.text,
+        "has_file": True,
+    }
+    rows = [row for row in db.list_clips(filters) if row.get("status") != "too_short"]
+    profile: dict[str, Any] | None = None
+    complete_ids: set[int] = set()
+    if req.profile_id:
+        selected = get_profile(req.profile_id)
+        complete_ids = {
+            int(record["clip_id"])
+            for record in db.list_clip_embeddings(selected.id)
+            if record.get("status") == "complete"
+            and Path(record.get("artifact_path") or "").is_file()
+        }
+        complete = sum(1 for row in rows if int(row["id"]) in complete_ids)
+        profile = {
+            **selected.to_dict(),
+            "complete_count": complete,
+            "target_count": len(rows),
+            "missing_count": max(0, len(rows) - complete),
+            "available": bool(rows) and complete == len(rows),
+        }
+
+    facets = {
+        "titles": _facet_counts(rows, "collection_title"),
+        "shot_sizes": _facet_counts(rows, "shot_size"),
+        "camera_motion": _facet_counts(rows, "camera_motion_type"),
+        "animation_motion": _facet_counts(rows, "animation_motion_bucket"),
+        "people": _facet_counts(rows, "people_count"),
+        "moods": _facet_counts(rows, "moods", many=True),
+        "tags": _facet_counts(rows, "tags", many=True),
+    }
+    start = max(0, int(req.offset))
+    stop = start + max(0, min(int(req.limit), 10000))
+    public_rows = []
+    for row in rows[start:stop]:
+        clip_id = int(row["id"])
+        public_rows.append({
+            "id": clip_id,
+            "movie_id": int(row.get("movie_id") or 0),
+            "clip_index": int(row.get("clip_index") or 0),
+            "start_time": float(row.get("start_time") or 0),
+            "end_time": float(row.get("end_time") or 0),
+            "duration": float(row.get("duration") or 0),
+            "collection_title": str(row.get("collection_title") or ""),
+            "original_name": str(row.get("movie_original_name") or ""),
+            "description": str(row.get("description") or ""),
+            "shot_size": str(row.get("shot_size") or "unknown"),
+            "camera_motion_type": str(row.get("camera_motion_type") or "unknown"),
+            "animation_motion_bucket": str(row.get("animation_motion_bucket") or "unknown"),
+            "people_count": str(row.get("people_count") or "unknown"),
+            "moods": list(row.get("moods") or []),
+            "tags": list(row.get("tags") or []),
+            "profile_complete": clip_id in complete_ids if req.profile_id else None,
+        })
+    durations = [float(row.get("duration") or 0) for row in rows]
+    return {
+        "clips": public_rows,
+        "count": len(rows),
+        "offset": start,
+        "limit": req.limit,
+        "filter_query": req.filter_query,
+        "facets": facets,
+        "profile": profile,
+        "duration": {
+            "min": round(min(durations), 2) if durations else 0,
+            "max": round(max(durations), 2) if durations else 0,
+            "total": round(sum(durations), 2),
+        },
+    }
+
+
 def _profile_embedding_vectors(profile_id: str) -> dict[int, tuple[Any, Any, Any]]:
     import numpy as np
 
@@ -940,6 +1036,14 @@ def semantic_match(req: SemanticMatchReq) -> dict[str, Any]:
         "profile_id": req.profile_id,
         "embedding_mode": req.embedding_mode,
     }
+
+
+@app.post("/catalog", dependencies=[Depends(auth)])
+def catalog(req: CatalogReq) -> dict[str, Any]:
+    try:
+        return _catalog(req)
+    except FilterQueryError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 class BundleReq(BaseModel):
