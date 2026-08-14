@@ -4,22 +4,62 @@ import json
 import re
 import shutil
 import threading
+import time
 from pathlib import Path
+from typing import Any, Callable
 
 import uuid
 from urllib.parse import unquote, urlparse
 
 from . import db
-from .config import CLIPS_DIR, DOWNLOAD_LINKS_PATH, FRAMES_DIR, METADATA_DIR, MOVIES_DIR, SETTINGS, ensure_library_dirs
+from .config import (
+    CLIPS_DIR,
+    DOWNLOAD_LINKS_PATH,
+    EMBEDDING_PROFILES_DIR,
+    FRAMES_DIR,
+    METADATA_DIR,
+    MOVIES_DIR,
+    SETTINGS,
+    ensure_library_dirs,
+)
 from .motion import analyze_motion
+from .languagebind import LanguageBindAnalyzer
+from .profiles import DEFAULT_PROFILE_ID, get_profile, normalize_embeddings_per_clip
 from .semantics import SemanticAnalyzer
 from .shot_detection import Shot, detect_shots
+from .timing import timing_event
 from .video_tools import ToolMissingError, download_movie, export_clip, ffprobe, file_sha256
 
 
 _job_lock = threading.Lock()
 _running_jobs: dict[int, threading.Thread] = {}
 _download_link_lock = threading.Lock()
+_semantic_lock = threading.Lock()
+
+
+def _timed_call(movie_id: int, stage: str, operation: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    started = time.perf_counter()
+    timing_event("stage_start", movie_id=movie_id, stage=stage)
+    try:
+        result = operation(*args, **kwargs)
+    except BaseException as exc:
+        timing_event(
+            "stage_end",
+            movie_id=movie_id,
+            stage=stage,
+            status="error",
+            elapsed_s=round(time.perf_counter() - started, 4),
+            error=type(exc).__name__,
+        )
+        raise
+    timing_event(
+        "stage_end",
+        movie_id=movie_id,
+        stage=stage,
+        status="paused" if _is_paused(movie_id) else "ok",
+        elapsed_s=round(time.perf_counter() - started, 4),
+    )
+    return result
 
 
 def ingest_url(url: str, original_name: str | None = None, collection_title: str = "") -> int:
@@ -58,12 +98,21 @@ def ingest_url(url: str, original_name: str | None = None, collection_title: str
             + (f" of {total / 1048576:.0f} MB ({pct:.1f}%)" if total else ""),
         )
 
+    ingest_started = time.perf_counter()
+    timing_event("ingest_start", movie_id=movie_id, source_type="url")
     try:
+        download_started = time.perf_counter()
         download_movie(url, target, progress=on_progress)
+        download_s = time.perf_counter() - download_started
+        probe_started = time.perf_counter()
         info = ffprobe(target)
+        probe_s = time.perf_counter() - probe_started
+        checksum_started = time.perf_counter()
+        checksum = file_sha256(target)
+        checksum_s = time.perf_counter() - checksum_started
         db.update_movie(
             movie_id,
-            checksum=file_sha256(target),
+            checksum=checksum,
             duration=float(info["duration"]),
             fps=float(info["fps"]),
             width=int(info["width"]),
@@ -73,7 +122,25 @@ def ingest_url(url: str, original_name: str | None = None, collection_title: str
             progress_detail="Ready to process",
             error=None,
         )
+        timing_event(
+            "ingest_end",
+            movie_id=movie_id,
+            source_type="url",
+            status="ok",
+            download_s=round(download_s, 4),
+            probe_s=round(probe_s, 4),
+            checksum_s=round(checksum_s, 4),
+            elapsed_s=round(time.perf_counter() - ingest_started, 4),
+        )
     except Exception as exc:  # noqa: BLE001
+        timing_event(
+            "ingest_end",
+            movie_id=movie_id,
+            source_type="url",
+            status="error",
+            elapsed_s=round(time.perf_counter() - ingest_started, 4),
+            error=type(exc).__name__,
+        )
         target.unlink(missing_ok=True)
         db.update_movie(movie_id, status="error", progress_stage="error", error=f"Download failed: {exc}")
         raise
@@ -116,13 +183,33 @@ def start_processing(movie_id: int) -> bool:
         return True
 
 
-def start_semantics_only(movie_id: int) -> bool:
+def start_semantics_only(
+    movie_id: int,
+    profile_id: str = DEFAULT_PROFILE_ID,
+    embeddings_per_clip: int | None = None,
+    overwrite: bool = False,
+) -> bool:
+    profile = get_profile(profile_id)
+    count = normalize_embeddings_per_clip(embeddings_per_clip, profile)
     with _job_lock:
         thread = _running_jobs.get(movie_id)
         if thread and thread.is_alive():
             return False
-        db.update_movie(movie_id, paused=0, status="processing", progress_stage="semantic_indexing", error=None)
-        thread = threading.Thread(target=process_semantics_only, args=(movie_id,), daemon=True)
+        db.update_movie(
+            movie_id,
+            paused=0,
+            status="processing",
+            progress_stage="semantic_indexing",
+            progress_detail=f"Waiting to generate {profile.label}",
+            active_embedding_profile=profile.id,
+            embeddings_per_clip=count,
+            error=None,
+        )
+        thread = threading.Thread(
+            target=process_semantics_only,
+            args=(movie_id, profile.id, count, overwrite),
+            daemon=True,
+        )
         _running_jobs[movie_id] = thread
         thread.start()
         return True
@@ -132,6 +219,32 @@ def is_processing(movie_id: int) -> bool:
     with _job_lock:
         thread = _running_jobs.get(movie_id)
         return bool(thread and thread.is_alive())
+
+
+def running_movie_ids() -> list[int]:
+    with _job_lock:
+        return [movie_id for movie_id, thread in _running_jobs.items() if thread.is_alive()]
+
+
+def embed_text_for_profile(profile_id: str, text: str) -> Any:
+    profile = get_profile(profile_id)
+    with _semantic_lock:
+        if profile.model_type == "languagebind":
+            analyzer: SemanticAnalyzer | LanguageBindAnalyzer = LanguageBindAnalyzer(
+                profile,
+                profile.default_embeddings_per_clip,
+            )
+        else:
+            analyzer = SemanticAnalyzer(
+                profile.model_name,
+                profile_id=profile.id,
+                embeddings_per_clip=profile.default_embeddings_per_clip,
+                input_size=profile.input_size,
+            )
+        try:
+            return analyzer.embed_text(text)
+        finally:
+            analyzer.close()
 
 
 def pause_processing(movie_id: int) -> None:
@@ -157,6 +270,14 @@ def reset_processing_outputs(movie_id: int, *, delete_source: bool = False) -> d
         if frame_dir.exists():
             shutil.rmtree(frame_dir, ignore_errors=True)
             removed += 1
+        profile_name = f"clip_{int(clip['id']):06d}"
+        for artifact in EMBEDDING_PROFILES_DIR.glob(f"*/{profile_name}.*"):
+            artifact.unlink(missing_ok=True)
+            removed += 1
+        for profile_frames in FRAMES_DIR.glob(f"*/{profile_name}"):
+            if profile_frames.is_dir():
+                shutil.rmtree(profile_frames, ignore_errors=True)
+                removed += 1
 
     folder_name = _movie_folder_name(movie_id, movie["original_name"])
     for folder in (CLIPS_DIR / folder_name, METADATA_DIR / folder_name):
@@ -243,10 +364,16 @@ def process_movie(movie_id: int) -> None:
     if not movie:
         return
 
+    pipeline_started = time.perf_counter()
+    outcome = "unknown"
+    timing_event("pipeline_start", movie_id=movie_id, mode="full")
     try:
         source = Path(movie["path"])
         db.update_movie(movie_id, status="processing", progress_stage="detecting_shots", progress_detail="Detecting shot boundaries")
-        shots, detector = detect_shots(
+        shots, detector = _timed_call(
+            movie_id,
+            "shot_detection",
+            detect_shots,
             source,
             float(movie["fps"] or 25.0),
             float(movie["duration"] or 0.0),
@@ -254,58 +381,114 @@ def process_movie(movie_id: int) -> None:
             SETTINGS.merge_tiny_shots_seconds,
         )
         db.update_movie(movie_id, detector=detector)
-        _store_shots(movie_id, shots)
+        _timed_call(movie_id, "shot_store", _store_shots, movie_id, shots)
         if _is_paused(movie_id):
+            outcome = "paused"
             return
 
         db.update_movie(movie_id, progress_stage="exporting_clips", progress_detail="Exporting MP4 clips")
-        _export_missing_clips(movie_id, source)
+        _timed_call(movie_id, "clip_export", _export_missing_clips, movie_id, source)
         if _is_paused(movie_id):
+            outcome = "paused"
             return
 
         db.update_movie(movie_id, progress_stage="motion_analysis", progress_detail="Analyzing camera and animation movement")
-        _analyze_missing_motion(movie_id, source)
+        _timed_call(movie_id, "motion_analysis", _analyze_missing_motion, movie_id, source)
         if _is_paused(movie_id):
+            outcome = "paused"
             return
 
         db.update_movie(movie_id, progress_stage="semantic_indexing", progress_detail="Creating semantic labels and embeddings")
-        _analyze_missing_semantics(movie_id, source)
+        _timed_call(movie_id, "semantic_indexing", _analyze_missing_semantics, movie_id, source)
         if _is_paused(movie_id):
+            outcome = "paused"
             return
 
         db.update_movie(movie_id, progress_stage="metadata_export", progress_detail="Writing metadata sidecars")
-        _write_all_metadata(movie_id)
+        _timed_call(movie_id, "metadata_export", _write_all_metadata, movie_id)
         db.update_movie(movie_id, status="complete", progress_stage="complete", progress_detail="Complete", error=None)
+        outcome = "complete"
     except ToolMissingError as exc:
+        outcome = "error"
         db.update_movie(movie_id, status="error", progress_stage="error", error=str(exc))
     except Exception as exc:
+        outcome = "error"
         db.update_movie(movie_id, status="error", progress_stage="error", error=repr(exc))
     finally:
+        timing_event(
+            "pipeline_end",
+            movie_id=movie_id,
+            mode="full",
+            status=outcome,
+            elapsed_s=round(time.perf_counter() - pipeline_started, 4),
+        )
         with _job_lock:
             _running_jobs.pop(movie_id, None)
 
 
-def process_semantics_only(movie_id: int) -> None:
+def process_semantics_only(
+    movie_id: int,
+    profile_id: str = DEFAULT_PROFILE_ID,
+    embeddings_per_clip: int | None = None,
+    overwrite: bool = False,
+) -> None:
     movie = db.get_movie(movie_id)
     if not movie:
         return
 
+    pipeline_started = time.perf_counter()
+    outcome = "unknown"
+    profile = get_profile(profile_id)
+    count = normalize_embeddings_per_clip(embeddings_per_clip, profile)
+    timing_event(
+        "pipeline_start",
+        movie_id=movie_id,
+        mode="semantics_only",
+        profile_id=profile.id,
+        embeddings_per_clip=count,
+    )
     try:
         source = Path(movie["path"])
         if not source.exists():
             raise FileNotFoundError(f"Source movie is missing: {source}")
-        reset_semantic_outputs(movie_id)
+        _timed_call(
+            movie_id,
+            "semantic_indexing",
+            _analyze_embedding_profile,
+            movie_id,
+            source,
+            profile.id,
+            count,
+            overwrite,
+            profile.model_type == "siglip2",
+        )
         if _is_paused(movie_id):
-            return
-        _analyze_missing_semantics(movie_id, source)
-        if _is_paused(movie_id):
+            outcome = "paused"
             return
         db.update_movie(movie_id, progress_stage="metadata_export", progress_detail="Writing metadata sidecars")
-        _write_all_metadata(movie_id)
-        db.update_movie(movie_id, status="complete", progress_stage="complete", progress_detail="Semantics refreshed", error=None)
+        _timed_call(movie_id, "metadata_export", _write_all_metadata, movie_id)
+        db.update_movie(
+            movie_id,
+            status="complete",
+            progress_stage="complete",
+            progress_detail=f"{profile.label} embeddings complete",
+            active_embedding_profile=profile.id,
+            embeddings_per_clip=count,
+            error=None,
+        )
+        outcome = "complete"
     except Exception as exc:  # noqa: BLE001
+        outcome = "error"
         db.update_movie(movie_id, status="error", progress_stage="error", error=repr(exc))
     finally:
+        timing_event(
+            "pipeline_end",
+            movie_id=movie_id,
+            mode="semantics_only",
+            status=outcome,
+            profile_id=profile.id,
+            elapsed_s=round(time.perf_counter() - pipeline_started, 4),
+        )
         with _job_lock:
             _running_jobs.pop(movie_id, None)
 
@@ -374,29 +557,134 @@ def _analyze_missing_motion(movie_id: int, source: Path) -> None:
 
 
 def _analyze_missing_semantics(movie_id: int, source: Path) -> None:
-    analyzer = SemanticAnalyzer()
-    for clip in db.list_clips({"movie_id": movie_id}):
-        if _is_paused(movie_id):
-            return
-        if clip["status"] in {"too_short"}:
-            continue
-        result = analyzer.analyze_clip(source, int(clip["id"]), float(clip["start_time"]), float(clip["end_time"]))
-        tags = result["tags"]
-        if result.get("semantic_model"):
-            tags = list(dict.fromkeys([*tags, result["semantic_model"]]))
-        db.update_clip(
-            int(clip["id"]),
-            status="indexed",
-            people_count=result["people_count"],
-            shot_size=result["shot_size"],
-            moods=result["moods"],
-            settings=result["settings"],
-            quality_flags=result["quality_flags"],
-            tags=tags,
-            description=result["description"],
-            embedding_path=result["embedding_path"],
-        )
-        _write_metadata(movie_id, int(clip["id"]), extra={"representative_frames": result.get("frame_paths", [])})
+    profile = get_profile(DEFAULT_PROFILE_ID)
+    _analyze_embedding_profile(
+        movie_id,
+        source,
+        profile.id,
+        SETTINGS.sample_frames_per_clip,
+        False,
+        True,
+    )
+
+
+def _analyze_embedding_profile(
+    movie_id: int,
+    source: Path,
+    profile_id: str,
+    embeddings_per_clip: int,
+    overwrite: bool,
+    update_labels: bool,
+) -> None:
+    profile = get_profile(profile_id)
+    movie = db.get_movie(movie_id) or {}
+    clips = [clip for clip in db.list_clips({"movie_id": movie_id}) if clip["status"] != "too_short"]
+    analyzer: SemanticAnalyzer | LanguageBindAnalyzer
+    with _semantic_lock:
+        if profile.model_type == "languagebind":
+            analyzer = LanguageBindAnalyzer(profile, embeddings_per_clip)
+        else:
+            analyzer = SemanticAnalyzer(
+                profile.model_name,
+                profile_id=profile.id,
+                embeddings_per_clip=embeddings_per_clip,
+                input_size=profile.input_size,
+            )
+        try:
+            for position, clip in enumerate(clips, start=1):
+                if _is_paused(movie_id):
+                    return
+                clip_id = int(clip["id"])
+                existing = db.get_clip_embedding(clip_id, profile.id)
+                if (
+                    not overwrite
+                    and existing
+                    and existing.get("status") == "complete"
+                    and int(existing.get("frame_count") or 0) == embeddings_per_clip
+                    and Path(existing.get("artifact_path") or "").exists()
+                ):
+                    continue
+                db.update_movie(
+                    movie_id,
+                    progress_detail=f"{profile.label}: {position}/{len(clips)}",
+                    active_embedding_profile=profile.id,
+                    embeddings_per_clip=embeddings_per_clip,
+                )
+                clip_started = time.perf_counter()
+                try:
+                    result = analyzer.analyze_clip(
+                        source,
+                        clip_id,
+                        float(clip["start_time"]),
+                        float(clip["end_time"]),
+                        movie_id=movie_id,
+                    )
+                    timings = result.pop("_timings", {})
+                    if result.get("semantic_model") == "fallback-cv":
+                        raise RuntimeError(result.get("description") or "Semantic model unavailable")
+                    db.upsert_clip_embedding(
+                        clip_id,
+                        profile.id,
+                        artifact_path=result["embedding_path"],
+                        frame_count=int(result.get("embedding_count") or 0),
+                        dimension=int(result.get("embedding_dimension") or 0),
+                        status="complete",
+                        source_checksum=str(movie.get("checksum") or ""),
+                    )
+                    db_started = time.perf_counter()
+                    if update_labels and "tags" in result:
+                        tags = result["tags"]
+                        if result.get("semantic_model"):
+                            tags = list(dict.fromkeys([*tags, result["semantic_model"]]))
+                        db.update_clip(
+                            clip_id,
+                            status="indexed",
+                            people_count=result["people_count"],
+                            shot_size=result["shot_size"],
+                            moods=result["moods"],
+                            settings=result["settings"],
+                            quality_flags=result["quality_flags"],
+                            tags=tags,
+                            description=result["description"],
+                            embedding_path=result["embedding_path"],
+                        )
+                    db_update_s = time.perf_counter() - db_started
+                    metadata_started = time.perf_counter()
+                    _write_metadata(
+                        movie_id,
+                        clip_id,
+                        extra={
+                            "representative_frames": result.get("frame_paths", []),
+                            "embedding_profile": profile.to_dict(),
+                            "embeddings_per_clip": embeddings_per_clip,
+                        },
+                    )
+                    metadata_s = time.perf_counter() - metadata_started
+                    timing_event(
+                        "semantic_clip",
+                        movie_id=movie_id,
+                        clip_id=clip_id,
+                        clip_index=int(clip["clip_index"]),
+                        profile_id=profile.id,
+                        embeddings_per_clip=embeddings_per_clip,
+                        start_time=round(float(clip["start_time"]), 3),
+                        end_time=round(float(clip["end_time"]), 3),
+                        db_update_s=round(db_update_s, 4),
+                        metadata_s=round(metadata_s, 4),
+                        total_s=round(time.perf_counter() - clip_started, 4),
+                        **timings,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    db.upsert_clip_embedding(
+                        clip_id,
+                        profile.id,
+                        status="failed",
+                        error=f"{type(exc).__name__}: {exc}",
+                        source_checksum=str(movie.get("checksum") or ""),
+                    )
+                    raise
+        finally:
+            analyzer.close()
 
 
 def _write_all_metadata(movie_id: int) -> None:

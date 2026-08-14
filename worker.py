@@ -9,6 +9,7 @@ Start:  WORKER_TOKEN=xxx uvicorn worker:app --host 0.0.0.0 --port 8100
 from __future__ import annotations
 
 import os
+import json
 import signal
 import shutil
 import subprocess
@@ -16,6 +17,7 @@ import sys
 import threading
 import time
 import zipfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -23,6 +25,7 @@ from typing import Any, Optional
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -37,15 +40,25 @@ from pipeline.config import (  # noqa: E402
     SETTINGS,
     ensure_library_dirs,
 )
+from pipeline.filter_query import FilterQueryError  # noqa: E402
+from pipeline.cloud_backup import (  # noqa: E402
+    create_snapshot,
+    list_snapshots,
+    rclone_ready,
+    restore_snapshot,
+)
 from pipeline.processor import (  # noqa: E402
+    embed_text_for_profile,
     ingest_url,
     is_processing,
     pause_processing,
     record_source_link,
     reset_processing_outputs,
+    running_movie_ids,
     start_semantics_only,
     start_processing,
 )
+from pipeline.profiles import BUILTIN_PROFILES, DEFAULT_PROFILE_ID, get_profile  # noqa: E402
 from pipeline.semantics import SemanticAnalyzer  # noqa: E402
 from pipeline.video_tools import ffprobe, file_sha256, has_nvenc, nvenc_usable  # noqa: E402
 
@@ -53,9 +66,10 @@ TOKEN = os.getenv("WORKER_TOKEN", "")
 STARTED_AT = time.time()
 SHUTDOWN_TIMER_PID = Path("/workspace/shutdown_timer.pid")
 SHUTDOWN_TIMER_LOG = Path("/workspace/shutdown_timer.log")
-_SEMANTIC_SEARCHER: SemanticAnalyzer | None = None
 
 app = FastAPI(title="Movie clips GPU worker")
+_CLOUD_JOBS: dict[str, dict[str, Any]] = {}
+_CLOUD_JOBS_LOCK = threading.Lock()
 
 
 VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
@@ -66,13 +80,6 @@ def auth(x_worker_token: str = Header(default="")) -> None:
         return  # unset means local testing
     if x_worker_token != TOKEN:
         raise HTTPException(401, "Bad or missing X-Worker-Token")
-
-
-def semantic_searcher() -> SemanticAnalyzer:
-    global _SEMANTIC_SEARCHER
-    if _SEMANTIC_SEARCHER is None:
-        _SEMANTIC_SEARCHER = SemanticAnalyzer()
-    return _SEMANTIC_SEARCHER
 
 
 def clean_filename(name: str, fallback: str = "upload.mp4") -> str:
@@ -88,10 +95,54 @@ def parse_float(value: str) -> float | None:
         return None
 
 
-def rank_semantic_clips(query: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def start_cloud_job(kind: str, operation, *args: Any, **kwargs: Any) -> str:
+    job_id = uuid.uuid4().hex[:12]
+    with _CLOUD_JOBS_LOCK:
+        _CLOUD_JOBS[job_id] = {
+            "id": job_id,
+            "kind": kind,
+            "status": "queued",
+            "message": "queued",
+            "progress": 0.0,
+            "result": None,
+            "error": "",
+        }
+
+    def progress(message: str, value: float) -> None:
+        with _CLOUD_JOBS_LOCK:
+            _CLOUD_JOBS[job_id].update(message=message, progress=max(0.0, min(1.0, value)))
+
+    def run() -> None:
+        with _CLOUD_JOBS_LOCK:
+            _CLOUD_JOBS[job_id]["status"] = "running"
+        try:
+            result = operation(*args, progress=progress, **kwargs)
+            with _CLOUD_JOBS_LOCK:
+                _CLOUD_JOBS[job_id].update(status="complete", progress=1.0, result=result)
+        except Exception as exc:  # noqa: BLE001
+            with _CLOUD_JOBS_LOCK:
+                _CLOUD_JOBS[job_id].update(
+                    status="failed",
+                    error=f"{type(exc).__name__}: {exc}",
+                    message="failed",
+                )
+
+    threading.Thread(target=run, daemon=True).start()
+    return job_id
+
+
+def rank_semantic_clips(
+    query: str,
+    rows: list[dict[str, Any]],
+    profile_id: str,
+    matching_mode: str,
+) -> list[dict[str, Any]]:
     import numpy as np
 
-    query_embedding = semantic_searcher().embed_text(query)
+    get_profile(profile_id)
+    if matching_mode not in {"mean_only", "mean_and_frames"}:
+        raise HTTPException(400, "embedding_mode must be mean_only or mean_and_frames")
+    query_embedding = embed_text_for_profile(profile_id, query)
     query_norm = float(np.linalg.norm(query_embedding))
     if query_norm <= 0:
         raise HTTPException(500, "Semantic query embedding has zero norm")
@@ -99,21 +150,41 @@ def rank_semantic_clips(query: str, rows: list[dict[str, Any]]) -> list[dict[str
 
     ranked: list[dict[str, Any]] = []
     for row in rows:
-        embedding_path = row.get("embedding_path")
+        record = db.get_clip_embedding(int(row["id"]), profile_id)
+        embedding_path = record.get("artifact_path") if record and record.get("status") == "complete" else None
+        if not embedding_path and profile_id == DEFAULT_PROFILE_ID:
+            embedding_path = row.get("embedding_path")
         if not embedding_path:
             continue
         path = Path(embedding_path)
-        if path.suffix.lower() != ".npy" or not path.exists():
+        if path.suffix.lower() not in {".npy", ".npz"} or not path.exists():
             continue
         try:
-            embedding = np.load(path).astype("float32")
+            loaded = np.load(path)
+            if path.suffix.lower() == ".npz":
+                embedding = loaded["mean"].astype("float32")
+                frames = loaded["frames"].astype("float32") if "frames" in loaded.files else np.zeros((0, 0), dtype="float32")
+            else:
+                embedding = loaded.astype("float32")
+                frames = np.zeros((0, 0), dtype="float32")
         except Exception:
             continue
         norm = float(np.linalg.norm(embedding))
         if norm <= 0:
             continue
         scored = dict(row)
-        scored["semantic_score"] = round(float(np.dot(query_embedding, embedding / norm)), 4)
+        mean_score = float(np.dot(query_embedding, embedding / norm))
+        frame_score = mean_score
+        if matching_mode == "mean_and_frames" and frames.size:
+            frame_norms = np.linalg.norm(frames, axis=1, keepdims=True)
+            normalized_frames = frames / np.maximum(frame_norms, 1e-9)
+            frame_score = max(mean_score, float(np.max(normalized_frames @ query_embedding)))
+        scored["semantic_score"] = round(
+            mean_score if matching_mode == "mean_only" else 0.6 * mean_score + 0.4 * frame_score,
+            4,
+        )
+        scored["embedding_profile"] = profile_id
+        scored["embedding_mode"] = matching_mode
         ranked.append(scored)
     ranked.sort(key=lambda item: item["semantic_score"], reverse=True)
     return ranked
@@ -160,6 +231,7 @@ def health() -> dict[str, Any]:
             "free_gb": round(usage.free / 1e9, 1),
         },
         "auth_required": bool(TOKEN),
+        "embedding_profiles": [profile.to_dict() for profile in BUILTIN_PROFILES],
     }
 
 
@@ -375,6 +447,12 @@ class TitleReq(BaseModel):
     update_original_name: bool = False
 
 
+class SemanticsReq(BaseModel):
+    profile_id: str = DEFAULT_PROFILE_ID
+    embeddings_per_clip: int | None = None
+    overwrite: bool = False
+
+
 @app.post("/jobs", dependencies=[Depends(auth)])
 def create_jobs(req: IngestReq) -> dict[str, Any]:
     """Queue one or more movie URLs. Downloads happen here, at datacenter speed."""
@@ -431,7 +509,19 @@ def jobs() -> dict[str, Any]:
         movie["downloadable_count"] = db.count_clips({"movie_id": movie["id"], "has_file": True})
         movie["motion_count"] = db.count_clips({"movie_id": movie["id"], "status": "motion_analyzed"})
         movie["indexed_count"] = db.count_clips({"movie_id": movie["id"], "status": "indexed"})
+        movie["embedding_profiles"] = db.list_embedding_profiles(int(movie["id"]))
     return {"movies": movies}
+
+
+@app.get("/embedding-profiles", dependencies=[Depends(auth)])
+def embedding_profiles(movie_id: Optional[int] = None) -> dict[str, Any]:
+    if movie_id is not None and not db.get_movie(movie_id):
+        raise HTTPException(404, "Movie not found")
+    return {
+        "profiles": db.list_embedding_profiles(movie_id),
+        "default_profile_id": DEFAULT_PROFILE_ID,
+        "matching_modes": ["mean_only", "mean_and_frames"],
+    }
 
 
 @app.get("/titles", dependencies=[Depends(auth)])
@@ -565,7 +655,7 @@ def pause_job(movie_id: int) -> dict[str, Any]:
 
 
 @app.post("/jobs/{movie_id}/semantics", dependencies=[Depends(auth)])
-def rerun_semantics_job(movie_id: int) -> dict[str, Any]:
+def rerun_semantics_job(movie_id: int, req: SemanticsReq) -> dict[str, Any]:
     movie = db.get_movie(movie_id)
     if not movie:
         raise HTTPException(404, "Movie not found")
@@ -573,7 +663,17 @@ def rerun_semantics_job(movie_id: int) -> dict[str, Any]:
         return {"started": False, "movie": movie, "message": "Movie is already running."}
     if db.count_clips({"movie_id": movie_id}) == 0:
         raise HTTPException(409, "No clips exist yet. Run the full job first.")
-    return {"started": start_semantics_only(movie_id), "movie": db.get_movie(movie_id)}
+    try:
+        profile = get_profile(req.profile_id)
+        started = start_semantics_only(
+            movie_id,
+            profile.id,
+            req.embeddings_per_clip,
+            req.overwrite,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"started": started, "movie": db.get_movie(movie_id), "profile": profile.to_dict()}
 
 
 @app.delete("/jobs/{movie_id}", dependencies=[Depends(auth)])
@@ -603,8 +703,11 @@ def delete_job(movie_id: int) -> dict[str, Any]:
 def clips(
     movie_id: Optional[int] = None,
     collection_title: Optional[str] = None,
+    filter_query: Optional[str] = None,
     text: Optional[str] = None,
     semantic_text: Optional[str] = None,
+    embedding_profile: str = DEFAULT_PROFILE_ID,
+    embedding_mode: str = "mean_and_frames",
     shot_size: Optional[str] = None,
     camera_motion_type: Optional[str] = None,
     animation_motion_bucket: Optional[str] = None,
@@ -620,6 +723,7 @@ def clips(
     filters = {
         "movie_id": movie_id,
         "collection_title": collection_title,
+        "filter_query": filter_query,
         "text": text,
         "shot_size": shot_size,
         "camera_motion_type": camera_motion_type,
@@ -632,18 +736,26 @@ def clips(
         "has_file": has_file,
     }
     semantic_query = (semantic_text or "").strip()
-    if semantic_query:
-        rows = rank_semantic_clips(semantic_query, db.list_clips(filters))
-        total_count = len(rows)
-        downloadable_count = sum(1 for row in rows if row.get("clip_path") and Path(row["clip_path"]).exists())
-        if offset:
-            rows = rows[max(0, int(offset)) :]
-        if limit is not None:
-            rows = rows[: max(0, int(limit))]
-    else:
-        rows = db.list_clips(filters, limit=limit, offset=offset)
-        total_count = db.count_clips(filters)
-        downloadable_count = db.count_clips({**filters, "has_file": True})
+    try:
+        if semantic_query:
+            rows = rank_semantic_clips(
+                semantic_query,
+                db.list_clips(filters),
+                embedding_profile,
+                embedding_mode,
+            )
+            total_count = len(rows)
+            downloadable_count = sum(1 for row in rows if row.get("clip_path") and Path(row["clip_path"]).exists())
+            if offset:
+                rows = rows[max(0, int(offset)) :]
+            if limit is not None:
+                rows = rows[: max(0, int(limit))]
+        else:
+            rows = db.list_clips(filters, limit=limit, offset=offset)
+            total_count = db.count_clips(filters)
+            downloadable_count = db.count_clips({**filters, "has_file": True})
+    except FilterQueryError as exc:
+        raise HTTPException(400, str(exc)) from exc
     for row in rows:
         path = row.get("clip_path")
         row["size_mb"] = round(Path(path).stat().st_size / 1048576, 2) if path and Path(path).exists() else None
@@ -652,6 +764,8 @@ def clips(
         "count": total_count,
         "downloadable_count": downloadable_count,
         "semantic": bool(semantic_query),
+        "embedding_profile": embedding_profile if semantic_query else None,
+        "embedding_mode": embedding_mode if semantic_query else None,
         "limit": limit,
         "offset": offset,
     }
@@ -672,6 +786,102 @@ def clip_file(clip_id: int) -> FileResponse:
 class BundleReq(BaseModel):
     movie_id: Optional[int] = None
     include_frames: bool = False
+
+
+class ProfileBundleReq(BaseModel):
+    movie_id: Optional[int] = None
+    collection_title: Optional[str] = None
+    include_clips: bool = True
+
+
+@app.post("/embedding-profiles/{profile_id}/bundle", dependencies=[Depends(auth)])
+def embedding_profile_bundle(profile_id: str, req: ProfileBundleReq) -> FileResponse:
+    try:
+        profile = get_profile(profile_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+    filters: dict[str, Any] = {}
+    if req.movie_id is not None:
+        filters["movie_id"] = req.movie_id
+    if req.collection_title:
+        filters["collection_title"] = req.collection_title
+    target_clips = [row for row in db.list_clips(filters) if row["status"] != "too_short"]
+    records = {int(row["clip_id"]): row for row in db.list_clip_embeddings(profile_id, req.movie_id)}
+    if req.collection_title:
+        records = {
+            clip_id: row
+            for clip_id, row in records.items()
+            if row.get("collection_title") == req.collection_title
+        }
+    missing = [
+        int(clip["id"])
+        for clip in target_clips
+        if not records.get(int(clip["id"]))
+        or records[int(clip["id"])].get("status") != "complete"
+        or not Path(records[int(clip["id"])].get("artifact_path") or "").exists()
+    ]
+    if not target_clips:
+        raise HTTPException(404, "No clips match this bundle request")
+    if missing:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "EMBEDDINGS_MISSING",
+                "profile_id": profile_id,
+                "complete": len(target_clips) - len(missing),
+                "missing": len(missing),
+                "message": "Generate this embedding profile in VastAI Program first.",
+            },
+        )
+
+    export_dir = LIBRARY_DIR / "exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    suffix = f"movie-{req.movie_id}" if req.movie_id is not None else clean_filename(req.collection_title or "all", "all")
+    out = export_dir / f"{profile_id}-{suffix}-{uuid.uuid4().hex[:8]}.zip"
+    manifest: dict[str, Any] = {
+        "format": "vastai-embedding-bundle-v1",
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "profile": profile.to_dict(),
+        "include_clips": req.include_clips,
+        "clips": [],
+    }
+    # MP4 and NPZ are already compressed; storing avoids wasting CPU while TikTokGen waits.
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_STORED, allowZip64=True) as archive:
+        for clip in target_clips:
+            clip_id = int(clip["id"])
+            record = records[clip_id]
+            artifact = Path(record["artifact_path"])
+            artifact_name = f"embeddings/clip_{clip_id:06d}.npz"
+            archive.write(artifact, artifact_name)
+            media_name = ""
+            clip_path = Path(clip.get("clip_path") or "")
+            if req.include_clips:
+                if not clip_path.is_file():
+                    raise HTTPException(409, f"Clip file is missing for clip {clip_id}")
+                media_name = f"clips/clip_{clip_id:06d}{clip_path.suffix.lower() or '.mp4'}"
+                archive.write(clip_path, media_name)
+            manifest["clips"].append({
+                "worker_clip_id": clip_id,
+                "movie_id": int(clip["movie_id"]),
+                "clip_index": int(clip["clip_index"]),
+                "start_time": float(clip["start_time"]),
+                "end_time": float(clip["end_time"]),
+                "duration": float(clip["duration"]),
+                "collection_title": record.get("collection_title") or "",
+                "original_name": record.get("original_name") or "",
+                "artifact": artifact_name,
+                "media": media_name,
+                "frame_count": int(record.get("frame_count") or 0),
+                "dimension": int(record.get("dimension") or 0),
+            })
+        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=True, indent=2))
+    return FileResponse(
+        out,
+        media_type="application/zip",
+        filename=out.name,
+        background=BackgroundTask(out.unlink, missing_ok=True),
+    )
 
 
 @app.post("/bundle", dependencies=[Depends(auth)])
@@ -709,6 +919,57 @@ def storage() -> dict[str, Any]:
         "frames_gb": size_of(LIBRARY_DIR / "frames"),
         "embeddings_gb": size_of(EMBEDDINGS_DIR),
     }
+
+
+class CloudBackupReq(BaseModel):
+    include_movies: bool = False
+    include_frames: bool = False
+
+
+class CloudRestoreReq(BaseModel):
+    snapshot_id: str
+    confirmation: str
+
+
+@app.get("/backups", dependencies=[Depends(auth)])
+def cloud_backups() -> dict[str, Any]:
+    return {
+        "rclone": rclone_ready(),
+        "snapshots": list_snapshots(),
+        "jobs": list(_CLOUD_JOBS.values()),
+    }
+
+
+@app.post("/backups", dependencies=[Depends(auth)])
+def cloud_backup_start(req: CloudBackupReq) -> dict[str, Any]:
+    job_id = start_cloud_job(
+        "backup",
+        create_snapshot,
+        include_movies=req.include_movies,
+        include_frames=req.include_frames,
+    )
+    return {"job_id": job_id, "laptop_may_disconnect": True}
+
+
+@app.get("/backups/jobs/{job_id}", dependencies=[Depends(auth)])
+def cloud_backup_job(job_id: str) -> dict[str, Any]:
+    with _CLOUD_JOBS_LOCK:
+        job = _CLOUD_JOBS.get(job_id)
+        if not job:
+            raise HTTPException(404, "Backup job not found")
+        return dict(job)
+
+
+@app.post("/backups/restore", dependencies=[Depends(auth)])
+def cloud_restore_start(req: CloudRestoreReq) -> dict[str, Any]:
+    expected = f"RESTORE {req.snapshot_id}"
+    if req.confirmation != expected:
+        raise HTTPException(400, f"confirmation must exactly equal {expected!r}")
+    active = running_movie_ids()
+    if active:
+        raise HTTPException(409, f"Pause active movie jobs before restore: {active}")
+    job_id = start_cloud_job("restore", restore_snapshot, req.snapshot_id)
+    return {"job_id": job_id, "warning": "The library will switch atomically after integrity validation."}
 
 
 class PurgeReq(BaseModel):

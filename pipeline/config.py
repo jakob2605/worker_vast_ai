@@ -15,6 +15,7 @@ CLIPS_DIR = LIBRARY_DIR / "clips"
 METADATA_DIR = LIBRARY_DIR / "metadata"
 FRAMES_DIR = LIBRARY_DIR / "frames"
 EMBEDDINGS_DIR = LIBRARY_DIR / "embeddings"
+EMBEDDING_PROFILES_DIR = EMBEDDINGS_DIR / "profiles"
 DB_PATH = LIBRARY_DIR / "movie_clips.sqlite3"
 DOWNLOAD_LINKS_PATH = LIBRARY_DIR / "download_links.jsonl"
 STATIC_DIR = ROOT / "web"
@@ -70,5 +71,5 @@ SETTINGS = ProcessingSettings()
 
 
 def ensure_library_dirs() -> None:
-    for path in [LIBRARY_DIR, MOVIES_DIR, CLIPS_DIR, METADATA_DIR, FRAMES_DIR, EMBEDDINGS_DIR]:
+    for path in [LIBRARY_DIR, MOVIES_DIR, CLIPS_DIR, METADATA_DIR, FRAMES_DIR, EMBEDDINGS_DIR, EMBEDDING_PROFILES_DIR]:
         path.mkdir(parents=True, exist_ok=True)

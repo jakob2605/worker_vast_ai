@@ -13,9 +13,9 @@ LOG=/workspace/worker.log
 echo "=== bootstrap $(date -u) ===" | tee -a "$LOG"
 
 # ffmpeg must exist for both cutting and probing.
-if ! command -v ffmpeg >/dev/null 2>&1; then
-  echo "installing ffmpeg" | tee -a "$LOG"
-  apt-get update -qq && apt-get install -y -qq ffmpeg >>"$LOG" 2>&1
+if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v rclone >/dev/null 2>&1; then
+  echo "installing ffmpeg and rclone" | tee -a "$LOG"
+  apt-get update -qq && apt-get install -y -qq ffmpeg rclone python3-venv >>"$LOG" 2>&1
 fi
 
 mkdir -p "$WORKER_DIR" "$LIBRARY_DIR"
@@ -104,6 +104,18 @@ echo "python: $PY" | tee -a "$LOG"
 
 "$PY" -c "import torch;print('torch',torch.__version__,'cuda',torch.cuda.is_available(),torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')" 2>&1 | tee -a "$LOG" || true
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>&1 | tee -a "$LOG" || true
+
+if [ "${INSTALL_LANGUAGEBIND:-1}" != "0" ] && [ -x "$WORKER_DIR/bootstrap_languagebind.sh" ]; then
+  if [ ! -x /workspace/venvs/languagebind/bin/python ]; then
+    echo "starting isolated LanguageBind setup in background" | tee -a "$LOG"
+    nohup bash "$WORKER_DIR/bootstrap_languagebind.sh" >>/workspace/languagebind-setup.log 2>&1 &
+  fi
+fi
+
+if [ -n "${RESTORE_SNAPSHOT:-}" ]; then
+  echo "restoring Google Drive snapshot ${RESTORE_SNAPSHOT}" | tee -a "$LOG"
+  (cd "$WORKER_DIR" && "$PY" -m pipeline.cloud_backup restore "$RESTORE_SNAPSHOT") 2>&1 | tee -a "$LOG"
+fi
 
 pkill -f "uvicorn worker:app" 2>/dev/null || true
 sleep 1

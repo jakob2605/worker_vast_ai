@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .config import DB_PATH, ensure_library_dirs
+from .filter_query import FilterClause, parse_filter_query
+from .profiles import BUILTIN_PROFILES
 
 
 def utc_now() -> str:
@@ -90,14 +92,42 @@ def init_db() -> None:
                 UNIQUE(movie_id, clip_index)
             );
 
+            CREATE TABLE IF NOT EXISTS embedding_profiles (
+                profile_id TEXT PRIMARY KEY,
+                label TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                model_type TEXT NOT NULL,
+                input_size INTEGER NOT NULL,
+                default_embeddings_per_clip INTEGER NOT NULL,
+                frames_per_embedding INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS clip_embeddings (
+                clip_id INTEGER NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+                profile_id TEXT NOT NULL REFERENCES embedding_profiles(profile_id) ON DELETE CASCADE,
+                artifact_path TEXT NOT NULL DEFAULT '',
+                frame_count INTEGER NOT NULL DEFAULT 0,
+                dimension INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'missing',
+                error TEXT NOT NULL DEFAULT '',
+                source_checksum TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (clip_id, profile_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_clips_movie ON clips(movie_id);
             CREATE INDEX IF NOT EXISTS idx_clips_duration ON clips(duration);
             CREATE INDEX IF NOT EXISTS idx_clips_camera ON clips(camera_motion_type);
             CREATE INDEX IF NOT EXISTS idx_clips_people ON clips(people_count);
             CREATE INDEX IF NOT EXISTS idx_clips_shot_size ON clips(shot_size);
+            CREATE INDEX IF NOT EXISTS idx_clip_embeddings_profile ON clip_embeddings(profile_id, status);
             """
         )
         _migrate(conn)
+        _sync_builtin_profiles(conn)
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -108,6 +138,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "collection_title": "TEXT DEFAULT ''",
             "encoder": "TEXT DEFAULT ''",
             "device": "TEXT DEFAULT ''",
+            "active_embedding_profile": "TEXT DEFAULT ''",
+            "embeddings_per_clip": "INTEGER DEFAULT 0",
         },
         "clips": {
             "downloaded_at": "TEXT DEFAULT ''",
@@ -118,6 +150,38 @@ def _migrate(conn: sqlite3.Connection) -> None:
         for name, decl in columns.items():
             if name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
+def _sync_builtin_profiles(conn: sqlite3.Connection) -> None:
+    now = utc_now()
+    for profile in BUILTIN_PROFILES:
+        conn.execute(
+            """
+            INSERT INTO embedding_profiles
+                (profile_id, label, model_name, model_type, input_size,
+                 default_embeddings_per_clip, frames_per_embedding, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(profile_id) DO UPDATE SET
+                label = excluded.label,
+                model_name = excluded.model_name,
+                model_type = excluded.model_type,
+                input_size = excluded.input_size,
+                default_embeddings_per_clip = excluded.default_embeddings_per_clip,
+                frames_per_embedding = excluded.frames_per_embedding,
+                updated_at = excluded.updated_at
+            """,
+            (
+                profile.id,
+                profile.label,
+                profile.model_name,
+                profile.model_type,
+                profile.input_size,
+                profile.default_embeddings_per_clip,
+                profile.frames_per_embedding,
+                now,
+                now,
+            ),
+        )
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -289,6 +353,113 @@ def delete_movie(movie_id: int) -> None:
         conn.execute("DELETE FROM movies WHERE id = ?", (movie_id,))
 
 
+def list_embedding_profiles(movie_id: int | None = None) -> list[dict[str, Any]]:
+    values: list[Any] = []
+    movie_clause = ""
+    if movie_id is not None:
+        movie_clause = " AND c.movie_id = ?"
+        values.append(movie_id)
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT p.*,
+                   COUNT(CASE WHEN ce.status = 'complete' AND c.id IS NOT NULL THEN 1 END) AS complete_count,
+                   COUNT(CASE WHEN ce.status = 'failed' AND c.id IS NOT NULL THEN 1 END) AS failed_count
+            FROM embedding_profiles p
+            LEFT JOIN clip_embeddings ce ON ce.profile_id = p.profile_id
+            LEFT JOIN clips c ON c.id = ce.clip_id{movie_clause}
+            GROUP BY p.profile_id
+            ORDER BY p.label COLLATE NOCASE
+            """,
+            values,
+        ).fetchall()
+        if movie_id is None:
+            target_count = int(conn.execute("SELECT COUNT(*) FROM clips WHERE status != 'too_short'").fetchone()[0])
+        else:
+            target_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM clips WHERE movie_id = ? AND status != 'too_short'",
+                    (movie_id,),
+                ).fetchone()[0]
+            )
+    out = [dict(row) for row in rows]
+    for item in out:
+        item["target_count"] = target_count
+        item["missing_count"] = max(0, target_count - int(item["complete_count"] or 0))
+    return out
+
+
+def get_clip_embedding(clip_id: int, profile_id: str) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM clip_embeddings WHERE clip_id = ? AND profile_id = ?",
+            (clip_id, profile_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_clip_embeddings(profile_id: str, movie_id: int | None = None) -> list[dict[str, Any]]:
+    sql = """
+        SELECT ce.*, c.movie_id, c.clip_index, c.clip_path, c.start_time, c.end_time,
+               c.duration, m.collection_title, m.original_name, m.checksum AS movie_checksum
+        FROM clip_embeddings ce
+        JOIN clips c ON c.id = ce.clip_id
+        JOIN movies m ON m.id = c.movie_id
+        WHERE ce.profile_id = ?
+    """
+    values: list[Any] = [profile_id]
+    if movie_id is not None:
+        sql += " AND c.movie_id = ?"
+        values.append(movie_id)
+    sql += " ORDER BY c.movie_id, c.clip_index"
+    with connect() as conn:
+        rows = conn.execute(sql, values).fetchall()
+    return [dict(row) for row in rows]
+
+
+def upsert_clip_embedding(
+    clip_id: int,
+    profile_id: str,
+    *,
+    artifact_path: str = "",
+    frame_count: int = 0,
+    dimension: int = 0,
+    status: str,
+    error: str = "",
+    source_checksum: str = "",
+) -> None:
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO clip_embeddings
+                (clip_id, profile_id, artifact_path, frame_count, dimension, status,
+                 error, source_checksum, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(clip_id, profile_id) DO UPDATE SET
+                artifact_path = excluded.artifact_path,
+                frame_count = excluded.frame_count,
+                dimension = excluded.dimension,
+                status = excluded.status,
+                error = excluded.error,
+                source_checksum = excluded.source_checksum,
+                updated_at = excluded.updated_at
+            """,
+            (
+                clip_id,
+                profile_id,
+                artifact_path,
+                frame_count,
+                dimension,
+                status,
+                error,
+                source_checksum,
+                now,
+                now,
+            ),
+        )
+
+
 def _clip_where(filters: dict[str, Any] | None = None) -> tuple[list[str], list[Any]]:
     filters = filters or {}
     where: list[str] = []
@@ -323,6 +494,10 @@ def _clip_where(filters: dict[str, Any] | None = None) -> tuple[list[str], list[
         values.append(filters["status"])
     if filters.get("has_file"):
         where.append("clips.clip_path IS NOT NULL AND clips.clip_path != ''")
+    for clause in parse_filter_query((filters.get("filter_query") or "").strip()):
+        clause_sql, clause_values = _advanced_clause_sql(clause)
+        where.append(clause_sql)
+        values.extend(clause_values)
     text = (filters.get("text") or "").strip().lower()
     if text:
         text_like = f"%{text}%"
@@ -348,6 +523,56 @@ def _clip_where(filters: dict[str, Any] | None = None) -> tuple[list[str], list[
         values.append(f'%"{tag}"%')
 
     return where, values
+
+
+def _advanced_clause_sql(clause: FilterClause) -> tuple[str, list[Any]]:
+    values = list(clause.values)
+    if clause.field == "title":
+        placeholders = ", ".join("?" for _ in values)
+        keyword = "NOT IN" if clause.operator == "!=" else "IN"
+        return f"LOWER(movies.collection_title) {keyword} ({placeholders})", [value.lower() for value in values]
+
+    if clause.field == "people":
+        expression = "CASE clips.people_count WHEN 'none' THEN 0 WHEN 'one' THEN 1 WHEN 'two' THEN 2 WHEN 'group' THEN 3 ELSE -1 END"
+        return f"{expression} {clause.operator} ?", [int(float(values[0]))]
+
+    if clause.field in {"minsec", "maxsec", "duration"}:
+        operator = clause.operator
+        if clause.field == "minsec" and operator == "=":
+            operator = ">="
+        elif clause.field == "maxsec" and operator == "=":
+            operator = "<="
+        return f"clips.duration {operator} ?", [float(values[0])]
+
+    if clause.field in {"shot", "camera", "motion"}:
+        column = {
+            "shot": "clips.shot_size",
+            "camera": "clips.camera_motion_type",
+            "motion": "clips.animation_motion_bucket",
+        }[clause.field]
+        placeholders = ", ".join("?" for _ in values)
+        keyword = "NOT IN" if clause.operator == "!=" else "IN"
+        return f"LOWER({column}) {keyword} ({placeholders})", [value.lower() for value in values]
+
+    if clause.field in {"mood", "tag"}:
+        column = "clips.moods" if clause.field == "mood" else "clips.tags"
+        comparisons = []
+        sql_values: list[Any] = []
+        for value in values:
+            comparisons.append(f"LOWER({column}) {'NOT LIKE' if clause.operator == '!=' else 'LIKE'} ?")
+            sql_values.append(f'%"{value.lower()}"%')
+        joiner = " AND " if clause.operator == "!=" else " OR "
+        return f"({joiner.join(comparisons)})", sql_values
+
+    if clause.field == "files":
+        enabled = values[0].lower() in {"true", "yes", "1"}
+        if clause.operator == "!=":
+            enabled = not enabled
+        if enabled:
+            return "(clips.clip_path IS NOT NULL AND clips.clip_path != '')", []
+        return "(clips.clip_path IS NULL OR clips.clip_path = '')", []
+
+    raise ValueError(f"Unsupported advanced filter field: {clause.field}")
 
 
 def count_clips(filters: dict[str, Any] | None = None) -> int:

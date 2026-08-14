@@ -67,7 +67,7 @@ def sample_frames(video_path: Path, start_time: float, end_time: float, sample_c
         return []
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     duration = max(0.01, end_time - start_time)
-    times = np.linspace(start_time + duration * 0.12, end_time - duration * 0.12, max(2, sample_count))
+    times = np.linspace(start_time + duration * 0.12, end_time - duration * 0.12, max(1, sample_count))
     frames: list[np.ndarray] = []
     for timestamp in times:
         cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(timestamp * fps)))

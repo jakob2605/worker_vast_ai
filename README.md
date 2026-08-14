@@ -50,6 +50,10 @@ clone the worker code during bootstrap.
 | `USE_NVENC` | on when CUDA | GPU encoding |
 | `SIGLIP_BATCH` | 32 on GPU, 5 on CPU | Frames per forward pass |
 | `SIGLIP_FP16` | on when CUDA | Half precision |
+| `LANGUAGEBIND_PYTHON` | `/workspace/venvs/languagebind/bin/python` | Isolated LanguageBind runtime |
+| `LANGUAGEBIND_REPO` | `/workspace/LanguageBind` | LanguageBind source checkout |
+| `RCLONE_REMOTE` | `gdrive:VastAIProgram` | Unencrypted Google Drive backup root |
+| `RESTORE_SNAPSHOT` | *(unset)* | `latest` or snapshot id restored during bootstrap |
 
 ## API
 
@@ -62,6 +66,10 @@ POST /jobs/{id}/start|pause  resume control (your original pause flags)
 GET  /clips?text=&shot_size= search the remote library
 GET  /clips/{id}/file        pull ONE clip back
 POST /bundle                 zip of sqlite + metadata + embeddings (no video)
+GET  /embedding-profiles     profile registry and completeness
+POST /jobs/{id}/semantics    generate one selected profile non-destructively
+POST /embedding-profiles/{profile}/bundle  TikTokGen transfer bundle
+GET/POST /backups            Google Drive snapshots and restore jobs
 GET  /storage                disk used by movies/clips/frames/embeddings
 POST /purge                  delete source movies, keep clips
 ```
