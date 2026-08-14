@@ -262,13 +262,17 @@ def _catalog(req: CatalogReq) -> dict[str, Any]:
             if record.get("status") == "complete"
             and Path(record.get("artifact_path") or "").is_file()
         }
-        complete = sum(1 for row in rows if int(row["id"]) in complete_ids)
+        source_target_count = len(rows)
+        rows = [row for row in rows if int(row["id"]) in complete_ids]
+        available_rows = [row for row in available_rows if int(row["id"]) in complete_ids]
         profile = {
             **selected.to_dict(),
-            "complete_count": complete,
+            "complete_count": len(rows),
             "target_count": len(rows),
-            "missing_count": max(0, len(rows) - complete),
-            "available": bool(rows) and complete == len(rows),
+            "missing_count": 0,
+            "source_target_count": source_target_count,
+            "excluded_missing_count": max(0, source_target_count - len(rows)),
+            "available": bool(rows),
         }
 
     facets = _catalog_facets(rows)
