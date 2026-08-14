@@ -370,6 +370,11 @@ class IngestReq(BaseModel):
     allow_reprocess: bool = False
 
 
+class TitleReq(BaseModel):
+    title: str
+    update_original_name: bool = False
+
+
 @app.post("/jobs", dependencies=[Depends(auth)])
 def create_jobs(req: IngestReq) -> dict[str, Any]:
     """Queue one or more movie URLs. Downloads happen here, at datacenter speed."""
@@ -432,6 +437,21 @@ def jobs() -> dict[str, Any]:
 @app.get("/titles", dependencies=[Depends(auth)])
 def titles() -> dict[str, Any]:
     return {"titles": db.list_collection_titles()}
+
+
+@app.post("/jobs/{movie_id}/title", dependencies=[Depends(auth)])
+def update_job_title(movie_id: int, req: TitleReq) -> dict[str, Any]:
+    movie = db.get_movie(movie_id)
+    if not movie:
+        raise HTTPException(404, "Movie not found")
+    title = req.title.strip()
+    if not title:
+        raise HTTPException(400, "title is required")
+    fields: dict[str, Any] = {"collection_title": title}
+    if req.update_original_name:
+        fields["original_name"] = title
+    db.update_movie(movie_id, **fields)
+    return {"movie": db.get_movie(movie_id), "titles": db.list_collection_titles()}
 
 
 @app.post("/uploads", dependencies=[Depends(auth)])
