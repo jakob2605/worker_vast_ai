@@ -85,6 +85,8 @@ class LanguageBindAnalyzer:
         saved_paths: list[str] = []
         clip_dir = FRAMES_DIR / self.profile.id / f"clip_{clip_id:06d}"
         clip_dir.mkdir(parents=True, exist_ok=True)
+        for old_frame in clip_dir.glob("*.jpg"):
+            old_frame.unlink(missing_ok=True)
 
         for window_index in range(self.embeddings_per_clip):
             lo = float(boundaries[window_index])

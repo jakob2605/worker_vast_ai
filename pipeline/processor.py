@@ -24,7 +24,12 @@ from .config import (
 )
 from .motion import analyze_motion
 from .languagebind import LanguageBindAnalyzer
-from .profiles import DEFAULT_PROFILE_ID, get_profile, normalize_embeddings_per_clip
+from .profiles import (
+    DEFAULT_PROFILE_ID,
+    adaptive_embeddings_per_clip,
+    get_profile,
+    normalize_embeddings_per_clip,
+)
 from .semantics import SemanticAnalyzer
 from .shot_detection import Shot, detect_shots
 from .timing import timing_event
@@ -189,9 +194,21 @@ def start_semantics_only(
     profile_id: str = DEFAULT_PROFILE_ID,
     embeddings_per_clip: int | None = None,
     overwrite: bool = False,
+    sampling_mode: str = "adaptive",
+    adaptive_seconds: float = 1.5,
+    adaptive_min: int = 3,
+    adaptive_max: int = 16,
 ) -> bool:
     profile = get_profile(profile_id)
     count = normalize_embeddings_per_clip(embeddings_per_clip, profile)
+    mode = "fixed" if sampling_mode == "fixed" else "adaptive"
+    if mode == "adaptive":
+        adaptive_embeddings_per_clip(
+            0,
+            seconds_per_vector=adaptive_seconds,
+            minimum=adaptive_min,
+            maximum=adaptive_max,
+        )
     with _job_lock:
         thread = _running_jobs.get(movie_id)
         if thread and thread.is_alive():
@@ -209,7 +226,10 @@ def start_semantics_only(
         )
         thread = threading.Thread(
             target=process_semantics_only,
-            args=(movie_id, profile.id, count, overwrite),
+            args=(
+                movie_id, profile.id, count, overwrite, mode,
+                adaptive_seconds, adaptive_min, adaptive_max,
+            ),
             daemon=True,
         )
         _running_jobs[movie_id] = thread
@@ -452,6 +472,10 @@ def process_semantics_only(
     profile_id: str = DEFAULT_PROFILE_ID,
     embeddings_per_clip: int | None = None,
     overwrite: bool = False,
+    sampling_mode: str = "adaptive",
+    adaptive_seconds: float = 1.5,
+    adaptive_min: int = 3,
+    adaptive_max: int = 16,
 ) -> None:
     movie = db.get_movie(movie_id)
     if not movie:
@@ -467,6 +491,7 @@ def process_semantics_only(
         mode="semantics_only",
         profile_id=profile.id,
         embeddings_per_clip=count,
+        sampling_mode=sampling_mode,
     )
     try:
         source = Path(movie["path"])
@@ -482,6 +507,10 @@ def process_semantics_only(
             count,
             overwrite,
             profile.model_type == "siglip2",
+            sampling_mode,
+            adaptive_seconds,
+            adaptive_min,
+            adaptive_max,
         )
         if _is_paused(movie_id):
             outcome = "paused"
@@ -586,6 +615,10 @@ def _analyze_missing_semantics(movie_id: int, source: Path) -> None:
         SETTINGS.sample_frames_per_clip,
         False,
         True,
+        "adaptive",
+        1.5,
+        3,
+        16,
     )
 
 
@@ -596,6 +629,10 @@ def _analyze_embedding_profile(
     embeddings_per_clip: int,
     overwrite: bool,
     update_labels: bool,
+    sampling_mode: str = "adaptive",
+    adaptive_seconds: float = 1.5,
+    adaptive_min: int = 3,
+    adaptive_max: int = 16,
 ) -> None:
     profile = get_profile(profile_id)
     movie = db.get_movie(movie_id) or {}
@@ -616,12 +653,23 @@ def _analyze_embedding_profile(
                 if _is_paused(movie_id):
                     return
                 clip_id = int(clip["id"])
+                clip_embeddings = (
+                    adaptive_embeddings_per_clip(
+                        float(clip.get("duration") or 0),
+                        seconds_per_vector=adaptive_seconds,
+                        minimum=adaptive_min,
+                        maximum=adaptive_max,
+                    )
+                    if sampling_mode != "fixed"
+                    else embeddings_per_clip
+                )
+                analyzer.embeddings_per_clip = clip_embeddings
                 existing = db.get_clip_embedding(clip_id, profile.id)
                 if (
                     not overwrite
                     and existing
                     and existing.get("status") == "complete"
-                    and int(existing.get("frame_count") or 0) == embeddings_per_clip
+                    and int(existing.get("frame_count") or 0) == clip_embeddings
                     and Path(existing.get("artifact_path") or "").exists()
                 ):
                     continue
@@ -629,7 +677,7 @@ def _analyze_embedding_profile(
                     movie_id,
                     progress_detail=f"{profile.label}: {position}/{len(clips)}",
                     active_embedding_profile=profile.id,
-                    embeddings_per_clip=embeddings_per_clip,
+                    embeddings_per_clip=clip_embeddings,
                 )
                 clip_started = time.perf_counter()
                 try:
@@ -677,7 +725,13 @@ def _analyze_embedding_profile(
                         extra={
                             "representative_frames": result.get("frame_paths", []),
                             "embedding_profile": profile.to_dict(),
-                            "embeddings_per_clip": embeddings_per_clip,
+                            "embeddings_per_clip": clip_embeddings,
+                            "sampling_mode": sampling_mode,
+                            "adaptive_sampling": {
+                                "seconds_per_vector": adaptive_seconds,
+                                "minimum": adaptive_min,
+                                "maximum": adaptive_max,
+                            } if sampling_mode != "fixed" else None,
                         },
                     )
                     metadata_s = time.perf_counter() - metadata_started
@@ -687,7 +741,8 @@ def _analyze_embedding_profile(
                         clip_id=clip_id,
                         clip_index=int(clip["clip_index"]),
                         profile_id=profile.id,
-                        embeddings_per_clip=embeddings_per_clip,
+                        embeddings_per_clip=clip_embeddings,
+                        sampling_mode=sampling_mode,
                         start_time=round(float(clip["start_time"]), 3),
                         end_time=round(float(clip["end_time"]), 3),
                         db_update_s=round(db_update_s, 4),

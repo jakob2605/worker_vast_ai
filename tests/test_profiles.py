@@ -9,10 +9,16 @@ from pipeline.profiles import (
     BUILTIN_PROFILES,
     get_profile,
     normalize_embeddings_per_clip,
+    adaptive_embeddings_per_clip,
 )
 
 
 class EmbeddingProfileTests(unittest.TestCase):
+    def test_adaptive_vector_count_scales_and_clamps(self) -> None:
+        self.assertEqual(adaptive_embeddings_per_clip(2.0), 3)
+        self.assertEqual(adaptive_embeddings_per_clip(10.0), 7)
+        self.assertEqual(adaptive_embeddings_per_clip(30.0), 16)
+
     def test_required_models_are_registered(self) -> None:
         models = {profile.model_name for profile in BUILTIN_PROFILES}
         self.assertIn("google/siglip2-base-patch16-224", models)

@@ -203,6 +203,7 @@ class SemanticMatchReq(BaseModel):
     movie_id: Optional[int] = None
     collection_title: Optional[str] = None
     filter_query: Optional[str] = None
+    clip_ids: list[int] = []
     limit: int = 80
 
 
@@ -385,8 +386,11 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
         "has_file": True,
     }
     available_vectors = _profile_embedding_vectors(req.profile_id)
+    allowed_ids = {int(clip_id) for clip_id in req.clip_ids if int(clip_id) > 0}
     candidates: list[tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray]] = []
     for row in db.list_clips(filters):
+        if allowed_ids and int(row["id"]) not in allowed_ids:
+            continue
         cached = available_vectors.get(int(row["id"]))
         if cached is None:
             continue
@@ -441,7 +445,7 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
             "embedding_mode": req.embedding_mode,
         })
         ranked.append(row)
-        if len(ranked) >= max(1, min(int(req.limit), 1000)):
+        if len(ranked) >= max(1, min(int(req.limit), 10000)):
             break
     return ranked
 
@@ -707,6 +711,10 @@ class SemanticsReq(BaseModel):
     profile_id: str = DEFAULT_PROFILE_ID
     embeddings_per_clip: int | None = None
     overwrite: bool = False
+    sampling_mode: str = "adaptive"
+    adaptive_seconds: float = 1.5
+    adaptive_min: int = 3
+    adaptive_max: int = 16
 
 
 @app.post("/jobs", dependencies=[Depends(auth)])
@@ -926,6 +934,10 @@ def rerun_semantics_job(movie_id: int, req: SemanticsReq) -> dict[str, Any]:
             profile.id,
             req.embeddings_per_clip,
             req.overwrite,
+            req.sampling_mode,
+            req.adaptive_seconds,
+            req.adaptive_min,
+            req.adaptive_max,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc

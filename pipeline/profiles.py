@@ -75,3 +75,21 @@ def normalize_embeddings_per_clip(value: int | None, profile: EmbeddingProfile) 
     if count < 1 or count > 64:
         raise ValueError("embeddings_per_clip must be between 1 and 64")
     return count
+
+
+def adaptive_embeddings_per_clip(
+    duration: float,
+    *,
+    seconds_per_vector: float = 1.5,
+    minimum: int = 3,
+    maximum: int = 16,
+) -> int:
+    interval = float(seconds_per_vector)
+    low = int(minimum)
+    high = int(maximum)
+    if interval < 0.5 or interval > 10:
+        raise ValueError("seconds_per_vector must be between 0.5 and 10")
+    if low < 1 or high > 64 or low > high:
+        raise ValueError("adaptive vector limits must satisfy 1 <= minimum <= maximum <= 64")
+    desired = round(max(0.0, float(duration)) / interval)
+    return max(low, min(high, desired))
