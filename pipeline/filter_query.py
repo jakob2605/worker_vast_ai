@@ -170,8 +170,10 @@ def _validate_clause(field: str, operator: str, values: list[str]) -> None:
         raise FilterQueryError(f"{field} only supports = and !=")
     if operator != "=" and len(values) > 1:
         raise FilterQueryError("OR with multiple values currently requires the = operator")
-    if field in NUMERIC_FIELDS and len(values) > 1:
+    if field in NUMERIC_FIELDS and field != "people" and len(values) > 1:
         raise FilterQueryError(f"{field} accepts one numeric value per condition")
+    if field == "people" and len(values) > 1 and operator != "=":
+        raise FilterQueryError("People accepts multiple values only with the = operator")
     if field == "files" and len(values) > 1:
         raise FilterQueryError("Files accepts one boolean value per condition")
     if field in NUMERIC_FIELDS:

@@ -534,6 +534,9 @@ def _advanced_clause_sql(clause: FilterClause) -> tuple[str, list[Any]]:
 
     if clause.field == "people":
         expression = "CASE clips.people_count WHEN 'none' THEN 0 WHEN 'one' THEN 1 WHEN 'two' THEN 2 WHEN 'group' THEN 3 ELSE -1 END"
+        if len(values) > 1:
+            placeholders = ", ".join("?" for _ in values)
+            return f"{expression} IN ({placeholders})", [int(float(value)) for value in values]
         return f"{expression} {clause.operator} ?", [int(float(values[0]))]
 
     if clause.field in {"minsec", "maxsec", "duration"}:

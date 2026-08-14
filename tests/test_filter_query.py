@@ -65,9 +65,16 @@ class FilterQueryTests(unittest.TestCase):
         with self.assertRaisesRegex(FilterQueryError, "Unclosed quoted value"):
             parse_filter_query('Movie/Show = "Porco Rosso')
 
-    def test_rejects_numeric_or(self) -> None:
+    def test_people_supports_multiple_values(self) -> None:
+        where, values = db._clip_where(  # noqa: SLF001
+            {"filter_query": "People = 0 OR 2 OR 3"}
+        )
+        self.assertIn("IN (?, ?, ?)", " AND ".join(where))
+        self.assertEqual(values, [0, 2, 3])
+
+    def test_rejects_multiple_duration_values(self) -> None:
         with self.assertRaisesRegex(FilterQueryError, "one numeric value"):
-            parse_filter_query("People = 1 OR 2")
+            parse_filter_query("MINSEC = 1 OR 2")
 
 
 if __name__ == "__main__":
