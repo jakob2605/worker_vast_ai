@@ -35,15 +35,9 @@ The dashboard's **Fill launch form for GPU worker** button sets the image, the
 `-p 8100:8100` port mapping, a 200 GB disk and an on-start command that carries
 `bootstrap.sh` gzipped+base64 (1.4 KB — under the API's ~4 KB onstart cap).
 
-`bootstrap.sh` installs ffmpeg and the Python deps, then starts the worker. The
-`pipeline/` code still has to reach the box — after the instance is running:
-
-```powershell
-vastai copy "C:\Users\jakob\Downloads\Vast_AI_Program\worker" <INSTANCE_ID>:/workspace/worker
-```
-
-Then re-run the bootstrap (or just restart the instance). The **Check worker** button
-shows this exact command when it can't reach the worker.
+`bootstrap.sh` installs ffmpeg and the Python deps, then starts the worker. For
+custom code delivery, set `WORKER_GIT_URL` in `.env` before launch so the box can
+clone the worker code during bootstrap.
 
 ## Environment variables
 
@@ -77,8 +71,9 @@ POST /purge                  delete source movies, keep clips
 Run end-to-end on CPU against a real 3-cut video: download by URL → 3 shots detected →
 3 MP4s exported → motion classified → all 3 indexed → `complete`. Single-clip pull and
 the metadata bundle both verified, and the bundle was confirmed to contain no video.
-SigLIP fell back to the heuristic path in that test because torch wasn't installed —
-that's your existing fallback behaving correctly, and the pytorch image supplies it.
+SigLIP fell back to the heuristic path in that local CPU test because torch was
+not installed there. The Vast PyTorch image supplies torch, and
+`requirements.txt` includes the tokenizer dependency used by SigLIP/SigLIP2.
 
 ## Cost note
 

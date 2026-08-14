@@ -1,9 +1,11 @@
 fastapi>=0.110
 uvicorn[standard]>=0.27
+python-multipart>=0.0.9
 numpy
 pillow
 opencv-python-headless
 transformers>=4.45
+sentencepiece
 scenedetect[opencv]
 transnetv2-pytorch
 # torch is preinstalled in the vastai/pytorch image - do not reinstall it there

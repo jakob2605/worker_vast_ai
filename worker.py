@@ -9,16 +9,18 @@ Start:  WORKER_TOKEN=xxx uvicorn worker:app --host 0.0.0.0 --port 8100
 from __future__ import annotations
 
 import os
+import signal
 import shutil
 import subprocess
 import sys
 import threading
 import time
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -35,14 +37,19 @@ from pipeline.config import (  # noqa: E402
     SETTINGS,
     ensure_library_dirs,
 )
-from pipeline.processor import ingest_url, pause_processing, start_processing  # noqa: E402
+from pipeline.processor import ingest_url, pause_processing, record_source_link, start_processing  # noqa: E402
 from pipeline.semantics import SemanticAnalyzer  # noqa: E402
-from pipeline.video_tools import has_nvenc, nvenc_usable  # noqa: E402
+from pipeline.video_tools import ffprobe, file_sha256, has_nvenc, nvenc_usable  # noqa: E402
 
 TOKEN = os.getenv("WORKER_TOKEN", "")
 STARTED_AT = time.time()
+SHUTDOWN_TIMER_PID = Path("/workspace/shutdown_timer.pid")
+SHUTDOWN_TIMER_LOG = Path("/workspace/shutdown_timer.log")
 
 app = FastAPI(title="Movie clips GPU worker")
+
+
+VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
 
 
 def auth(x_worker_token: str = Header(default="")) -> None:
@@ -50,6 +57,19 @@ def auth(x_worker_token: str = Header(default="")) -> None:
         return  # unset means local testing
     if x_worker_token != TOKEN:
         raise HTTPException(401, "Bad or missing X-Worker-Token")
+
+
+def clean_filename(name: str, fallback: str = "upload.mp4") -> str:
+    cleaned = Path((name or "").replace("\\", "/")).name.strip()
+    cleaned = "".join("_" if ch in '<>:"/\\|?*\x00' else ch for ch in cleaned).strip(" .")
+    return cleaned or fallback
+
+
+def parse_float(value: str) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 @app.on_event("startup")
@@ -96,6 +116,64 @@ def health() -> dict[str, Any]:
     }
 
 
+@app.get("/usage", dependencies=[Depends(auth)])
+def usage() -> dict[str, Any]:
+    gpu_rows: list[dict[str, Any]] = []
+    try:
+        raw = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,power.limit",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            timeout=10,
+        ).strip()
+        for line in raw.splitlines():
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) >= 8:
+                gpu_rows.append({
+                    "name": parts[0],
+                    "gpu_util_pct": parse_float(parts[1]),
+                    "memory_util_pct": parse_float(parts[2]),
+                    "memory_used_mb": parse_float(parts[3]),
+                    "memory_total_mb": parse_float(parts[4]),
+                    "temperature_c": parse_float(parts[5]),
+                    "power_draw_w": parse_float(parts[6]),
+                    "power_limit_w": parse_float(parts[7]),
+                })
+    except Exception as exc:  # noqa: BLE001
+        gpu_rows.append({"error": f"{type(exc).__name__}: {exc}"})
+
+    disk = shutil.disk_usage(LIBRARY_DIR if LIBRARY_DIR.exists() else Path("/"))
+    mem: dict[str, float] = {}
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            key, raw_value = line.split(":", 1)
+            value_kb = parse_float(raw_value.strip().split()[0])
+            if value_kb is not None:
+                mem[key] = round(value_kb / 1024, 1)
+    except Exception:  # noqa: BLE001
+        pass
+    load = os.getloadavg() if hasattr(os, "getloadavg") else (0.0, 0.0, 0.0)
+    return {
+        "gpu": gpu_rows,
+        "cpu_load": {"1m": load[0], "5m": load[1], "15m": load[2]},
+        "memory": {
+            "total_mb": mem.get("MemTotal"),
+            "available_mb": mem.get("MemAvailable"),
+            "used_mb": round((mem.get("MemTotal", 0) - mem.get("MemAvailable", 0)), 1) if mem else None,
+        },
+        "disk": {
+            "path": str(LIBRARY_DIR),
+            "total_gb": round(disk.total / 1e9, 1),
+            "used_gb": round(disk.used / 1e9, 1),
+            "free_gb": round(disk.free / 1e9, 1),
+        },
+        "timestamp": time.time(),
+    }
+
+
 @app.post("/update", dependencies=[Depends(auth)])
 def update() -> dict[str, Any]:
     """
@@ -137,6 +215,99 @@ def update() -> dict[str, Any]:
     return result
 
 
+class ShutdownReq(BaseModel):
+    minutes: int
+
+
+@app.post("/shutdown-later", dependencies=[Depends(auth)])
+def shutdown_later(req: ShutdownReq) -> dict[str, Any]:
+    """
+    Schedule the instance/container to stop from inside the box.
+
+    The timer is a detached shell process, so it continues even if the local
+    dashboard or the worker process exits. This is intended as a cost guard;
+    persistent disk charges may still apply depending on the Vast instance
+    state after the container stops.
+    """
+    minutes = int(req.minutes)
+    if minutes < 1 or minutes > 10080:
+        raise HTTPException(400, "minutes must be between 1 and 10080")
+
+    if SHUTDOWN_TIMER_PID.exists():
+        try:
+            old_pid = int(SHUTDOWN_TIMER_PID.read_text(encoding="utf-8").strip())
+            os.kill(old_pid, 0)
+            raise HTTPException(409, f"Shutdown timer already scheduled as PID {old_pid}")
+        except ProcessLookupError:
+            SHUTDOWN_TIMER_PID.unlink(missing_ok=True)
+        except ValueError:
+            SHUTDOWN_TIMER_PID.unlink(missing_ok=True)
+
+    seconds = minutes * 60
+    due_at = time.time() + seconds
+    due_iso = datetime.fromtimestamp(due_at, timezone.utc).isoformat(timespec="seconds")
+    script = f"""
+set -eu
+echo "scheduled stop for {due_iso} after {minutes} minute(s)" >> "{SHUTDOWN_TIMER_LOG}"
+sleep {seconds}
+echo "stopping instance/container at $(date -u)" >> "{SHUTDOWN_TIMER_LOG}"
+sync || true
+shutdown -h now >> "{SHUTDOWN_TIMER_LOG}" 2>&1 || true
+poweroff >> "{SHUTDOWN_TIMER_LOG}" 2>&1 || true
+kill -TERM 1 >> "{SHUTDOWN_TIMER_LOG}" 2>&1 || true
+sleep 15
+kill -KILL 1 >> "{SHUTDOWN_TIMER_LOG}" 2>&1 || true
+"""
+    proc = subprocess.Popen(
+        ["bash", "-lc", script],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    SHUTDOWN_TIMER_PID.write_text(str(proc.pid), encoding="utf-8")
+    return {
+        "scheduled": True,
+        "minutes": minutes,
+        "seconds": seconds,
+        "due_at": due_at,
+        "due_at_utc": due_iso,
+        "pid": proc.pid,
+        "log": str(SHUTDOWN_TIMER_LOG),
+        "note": "Timer runs on the Vast instance; your laptop does not need to stay on.",
+    }
+
+
+@app.post("/shutdown-later/cancel", dependencies=[Depends(auth)])
+def cancel_shutdown_later() -> dict[str, Any]:
+    """Cancel a pending shutdown timer that was scheduled by this worker."""
+    if not SHUTDOWN_TIMER_PID.exists():
+        return {"cancelled": False, "message": "No shutdown timer is scheduled."}
+
+    try:
+        pid = int(SHUTDOWN_TIMER_PID.read_text(encoding="utf-8").strip())
+    except ValueError:
+        SHUTDOWN_TIMER_PID.unlink(missing_ok=True)
+        return {"cancelled": False, "message": "Removed invalid shutdown timer pid file."}
+
+    try:
+        os.killpg(pid, signal.SIGTERM)
+        cancelled = True
+        message = f"Cancelled shutdown timer PID {pid}."
+    except ProcessLookupError:
+        cancelled = False
+        message = f"Shutdown timer PID {pid} was not running."
+    finally:
+        SHUTDOWN_TIMER_PID.unlink(missing_ok=True)
+
+    try:
+        with SHUTDOWN_TIMER_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(f"{message} at {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n")
+    except OSError:
+        pass
+    return {"cancelled": cancelled, "pid": pid, "message": message, "log": str(SHUTDOWN_TIMER_LOG)}
+
+
 @app.get("/gpu", dependencies=[Depends(auth)])
 def gpu_detail() -> dict[str, Any]:
     analyzer = SemanticAnalyzer()
@@ -147,6 +318,7 @@ def gpu_detail() -> dict[str, Any]:
 # --------------------------------------------------------------------------
 class IngestReq(BaseModel):
     urls: list[str]
+    movie_name: str
     autostart: bool = True
 
 
@@ -154,12 +326,19 @@ class IngestReq(BaseModel):
 def create_jobs(req: IngestReq) -> dict[str, Any]:
     """Queue one or more movie URLs. Downloads happen here, at datacenter speed."""
     accepted: list[dict[str, Any]] = []
-    for url in [u.strip() for u in req.urls if u.strip()]:
-        holder: dict[str, Any] = {"url": url}
+    urls = [u.strip() for u in req.urls if u.strip()]
+    movie_name = req.movie_name.strip()
+    if not movie_name:
+        raise HTTPException(400, "movie_name is required")
+    if not urls:
+        raise HTTPException(400, "At least one movie URL is required")
+    for index, url in enumerate(urls, start=1):
+        original_name = movie_name if len(urls) == 1 else f"{movie_name} {index}"
+        holder: dict[str, Any] = {"url": url, "original_name": original_name}
 
-        def run(u: str = url, h: dict[str, Any] = holder) -> None:
+        def run(u: str = url, name: str = original_name, h: dict[str, Any] = holder) -> None:
             try:
-                movie_id = ingest_url(u)
+                movie_id = ingest_url(u, original_name=name, collection_title=movie_name)
                 h["movie_id"] = movie_id
                 if req.autostart:
                     start_processing(movie_id)
@@ -179,6 +358,71 @@ def jobs() -> dict[str, Any]:
         movie["downloadable_count"] = db.count_clips({"movie_id": movie["id"], "has_file": True})
         movie["indexed_count"] = db.count_clips({"movie_id": movie["id"], "status": "indexed"})
     return {"movies": movies}
+
+
+@app.get("/titles", dependencies=[Depends(auth)])
+def titles() -> dict[str, Any]:
+    return {"titles": db.list_collection_titles()}
+
+
+@app.post("/uploads", dependencies=[Depends(auth)])
+async def upload_jobs(
+    title: str = Form(...),
+    autostart: bool = Form(True),
+    files: list[UploadFile] = File(...),
+) -> dict[str, Any]:
+    collection_title = title.strip()
+    if not collection_title:
+        raise HTTPException(400, "title is required")
+    if not files:
+        raise HTTPException(400, "At least one file is required")
+
+    accepted: list[dict[str, Any]] = []
+    for file in files:
+        original_name = clean_filename(file.filename)
+        suffix = Path(original_name).suffix.lower()
+        if suffix and suffix not in VIDEO_SUFFIXES:
+            accepted.append({"original_name": original_name, "error": "Skipped non-video file"})
+            continue
+
+        filename = f"{int(time.time() * 1000)}_{len(accepted) + 1:04d}_{original_name}"
+        target = MOVIES_DIR / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with target.open("wb") as handle:
+                while chunk := await file.read(1024 * 1024):
+                    handle.write(chunk)
+            info = ffprobe(target)
+            movie_id = db.create_movie(
+                original_name=original_name,
+                filename=filename,
+                path=target,
+                checksum=file_sha256(target),
+                duration=float(info["duration"]),
+                fps=float(info["fps"]),
+                width=int(info["width"]),
+                height=int(info["height"]),
+                collection_title=collection_title,
+            )
+            source_url = f"local-upload:{original_name}"
+            db.update_movie(
+                movie_id,
+                status="imported",
+                progress_stage="imported",
+                progress_detail="Ready to process",
+                source_url=source_url,
+            )
+            record_source_link(movie_id, original_name, collection_title, source_url, target, source_type="upload")
+            if autostart:
+                start_processing(movie_id)
+            accepted.append({"movie_id": movie_id, "original_name": original_name})
+        except Exception as exc:  # noqa: BLE001
+            target.unlink(missing_ok=True)
+            accepted.append({"original_name": original_name, "error": str(exc)})
+        finally:
+            await file.close()
+    created = sum(1 for item in accepted if item.get("movie_id"))
+    return {"accepted": created, "items": accepted, "collection_title": collection_title}
 
 
 @app.post("/jobs/{movie_id}/start", dependencies=[Depends(auth)])
@@ -237,6 +481,7 @@ def delete_job(movie_id: int) -> dict[str, Any]:
 @app.get("/clips", dependencies=[Depends(auth)])
 def clips(
     movie_id: Optional[int] = None,
+    collection_title: Optional[str] = None,
     text: Optional[str] = None,
     shot_size: Optional[str] = None,
     camera_motion_type: Optional[str] = None,
@@ -252,6 +497,7 @@ def clips(
 ) -> dict[str, Any]:
     filters = {
         "movie_id": movie_id,
+        "collection_title": collection_title,
         "text": text,
         "shot_size": shot_size,
         "camera_motion_type": camera_motion_type,
@@ -267,7 +513,13 @@ def clips(
     for row in rows:
         path = row.get("clip_path")
         row["size_mb"] = round(Path(path).stat().st_size / 1048576, 2) if path and Path(path).exists() else None
-    return {"clips": rows, "count": db.count_clips(filters)}
+    return {
+        "clips": rows,
+        "count": db.count_clips(filters),
+        "downloadable_count": db.count_clips({**filters, "has_file": True}),
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @app.get("/clips/{clip_id}/file", dependencies=[Depends(auth)])
