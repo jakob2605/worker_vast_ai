@@ -39,7 +39,7 @@ from .video_tools import ToolMissingError, download_movie, export_clip, ffprobe,
 _job_lock = threading.Lock()
 _running_jobs: dict[int, threading.Thread] = {}
 _download_link_lock = threading.Lock()
-_semantic_lock = threading.Lock()
+_semantic_lock = threading.RLock()
 
 
 def _timed_call(movie_id: int, stage: str, operation: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -181,7 +181,6 @@ def start_processing(movie_id: int) -> bool:
         thread = _running_jobs.get(movie_id)
         if thread and thread.is_alive():
             return False
-        release_text_embedding_model()
         db.update_movie(movie_id, paused=0, status="queued", progress_stage="queued", error=None)
         thread = threading.Thread(target=process_movie, args=(movie_id,), daemon=True)
         _running_jobs[movie_id] = thread
@@ -213,7 +212,6 @@ def start_semantics_only(
         thread = _running_jobs.get(movie_id)
         if thread and thread.is_alive():
             return False
-        release_text_embedding_model()
         db.update_movie(
             movie_id,
             paused=0,
@@ -638,7 +636,22 @@ def _analyze_embedding_profile(
     movie = db.get_movie(movie_id) or {}
     clips = [clip for clip in db.list_clips({"movie_id": movie_id}) if clip["status"] != "too_short"]
     analyzer: SemanticAnalyzer | LanguageBindAnalyzer
+    queue_started = time.perf_counter()
+    db.update_movie(
+        movie_id,
+        progress_stage="semantic_indexing",
+        progress_detail=f"Waiting for GPU slot: {profile.label}",
+    )
     with _semantic_lock:
+        timing_event(
+            "semantic_gpu_acquired",
+            movie_id=movie_id,
+            profile_id=profile.id,
+            queue_wait_s=round(time.perf_counter() - queue_started, 4),
+        )
+        release_text_embedding_model()
+        if _is_paused(movie_id):
+            return
         if profile.model_type == "languagebind":
             analyzer = LanguageBindAnalyzer(profile, embeddings_per_clip)
         else:
