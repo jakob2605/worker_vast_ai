@@ -49,6 +49,7 @@ from pipeline.cloud_backup import (  # noqa: E402
 )
 from pipeline.processor import (  # noqa: E402
     embed_text_for_profile,
+    embed_texts_for_profile,
     ingest_url,
     is_processing,
     pause_processing,
@@ -70,6 +71,8 @@ SHUTDOWN_TIMER_LOG = Path("/workspace/shutdown_timer.log")
 app = FastAPI(title="Movie clips GPU worker")
 _CLOUD_JOBS: dict[str, dict[str, Any]] = {}
 _CLOUD_JOBS_LOCK = threading.Lock()
+_EMBEDDING_CACHE: dict[str, Any] = {"profile_id": "", "signature": (), "vectors": {}}
+_EMBEDDING_CACHE_LOCK = threading.Lock()
 
 
 VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
@@ -187,6 +190,148 @@ def rank_semantic_clips(
         scored["embedding_mode"] = matching_mode
         ranked.append(scored)
     ranked.sort(key=lambda item: item["semantic_score"], reverse=True)
+    return ranked
+
+
+class SemanticMatchReq(BaseModel):
+    profile_id: str = DEFAULT_PROFILE_ID
+    queries: list[str]
+    anchor: str = ""
+    anchor_weight: float = 0.3
+    embedding_mode: str = "mean_and_frames"
+    frame_weight: float = 0.4
+    movie_id: Optional[int] = None
+    collection_title: Optional[str] = None
+    filter_query: Optional[str] = None
+    limit: int = 80
+
+
+def _profile_embedding_vectors(profile_id: str) -> dict[int, tuple[Any, Any, Any]]:
+    import numpy as np
+
+    records = [row for row in db.list_clip_embeddings(profile_id) if row.get("status") == "complete"]
+    signature = tuple(
+        (int(row["clip_id"]), str(row.get("updated_at") or ""), str(row.get("artifact_path") or ""))
+        for row in records
+    )
+    with _EMBEDDING_CACHE_LOCK:
+        if _EMBEDDING_CACHE["profile_id"] == profile_id and _EMBEDDING_CACHE["signature"] == signature:
+            return _EMBEDDING_CACHE["vectors"]
+
+        vectors: dict[int, tuple[Any, Any, Any]] = {}
+        for record in records:
+            path = Path(record.get("artifact_path") or "")
+            if path.suffix.lower() not in {".npy", ".npz"} or not path.is_file():
+                continue
+            try:
+                loaded = np.load(path)
+                try:
+                    if hasattr(loaded, "files"):
+                        mean = np.asarray(loaded["mean"], dtype="float32").reshape(-1)
+                        frames = (
+                            np.asarray(loaded["frames"], dtype="float32")
+                            if "frames" in loaded.files else np.zeros((0, mean.size), dtype="float32")
+                        )
+                        times = (
+                            np.asarray(loaded["frame_times"], dtype="float32").reshape(-1)
+                            if "frame_times" in loaded.files else np.zeros((0,), dtype="float32")
+                        )
+                    else:
+                        mean = np.asarray(loaded, dtype="float32").reshape(-1)
+                        frames = np.zeros((0, mean.size), dtype="float32")
+                        times = np.zeros((0,), dtype="float32")
+                finally:
+                    if hasattr(loaded, "close"):
+                        loaded.close()
+            except Exception:
+                continue
+            mean /= max(float(np.linalg.norm(mean)), 1e-9)
+            if frames.size:
+                frames /= np.maximum(np.linalg.norm(frames, axis=1, keepdims=True), 1e-9)
+            vectors[int(record["clip_id"])] = (mean, frames, times)
+        _EMBEDDING_CACHE.update(profile_id=profile_id, signature=signature, vectors=vectors)
+        return vectors
+
+
+def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
+    import numpy as np
+
+    get_profile(req.profile_id)
+    if req.embedding_mode not in {"mean_only", "mean_and_frames"}:
+        raise HTTPException(400, "embedding_mode must be mean_only or mean_and_frames")
+    queries = [text.strip() for text in req.queries if text and text.strip()]
+    if not queries:
+        raise HTTPException(400, "queries must contain at least one non-empty string")
+    anchor = req.anchor.strip()
+    texts = queries + ([anchor] if anchor else [])
+    vectors = np.asarray(embed_texts_for_profile(req.profile_id, texts), dtype="float32")
+    vectors /= np.maximum(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-9)
+
+    filters = {
+        "movie_id": req.movie_id,
+        "collection_title": req.collection_title,
+        "filter_query": req.filter_query,
+        "has_file": True,
+    }
+    available_vectors = _profile_embedding_vectors(req.profile_id)
+    candidates: list[tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray]] = []
+    for row in db.list_clips(filters):
+        cached = available_vectors.get(int(row["id"]))
+        if cached is None:
+            continue
+        mean, frames, times = cached
+        if mean.size != vectors.shape[1]:
+            continue
+        candidates.append((row, mean, frames, times))
+
+    if not candidates:
+        return []
+    scores = np.zeros((len(queries), len(candidates)), dtype="float32")
+    best_times = np.zeros((len(queries), len(candidates)), dtype="float32")
+    frame_weight = 0.0 if req.embedding_mode == "mean_only" else min(1.0, max(0.0, req.frame_weight))
+    for qi, query in enumerate(vectors[:len(queries)]):
+        for ci, (_, mean, frames, times) in enumerate(candidates):
+            mean_score = float(mean @ query)
+            frame_score = mean_score
+            if frame_weight and frames.size:
+                frame_scores = frames @ query
+                best_index = int(np.argmax(frame_scores))
+                frame_score = max(mean_score, float(frame_scores[best_index]))
+                if best_index < times.size:
+                    best_times[qi, ci] = float(times[best_index])
+            scores[qi, ci] = (1.0 - frame_weight) * mean_score + frame_weight * frame_score
+    means = scores.mean(axis=1, keepdims=True)
+    stds = scores.std(axis=1, keepdims=True)
+    z_scores = (scores - means) / np.maximum(stds, 1e-6)
+    winning_query = z_scores.argmax(axis=0)
+    combined = z_scores.max(axis=0)
+    if anchor:
+        anchor_vector = vectors[-1]
+        anchor_scores = np.zeros(len(candidates), dtype="float32")
+        for ci, (_, mean, frames, _) in enumerate(candidates):
+            mean_score = float(mean @ anchor_vector)
+            frame_score = max(mean_score, float(np.max(frames @ anchor_vector))) if frame_weight and frames.size else mean_score
+            anchor_scores[ci] = (1.0 - frame_weight) * mean_score + frame_weight * frame_score
+        anchor_z = (anchor_scores - anchor_scores.mean()) / max(float(anchor_scores.std()), 1e-6)
+        weight = min(1.0, max(0.0, req.anchor_weight))
+        combined = (1.0 - weight) * combined + weight * anchor_z
+
+    ranked: list[dict[str, Any]] = []
+    for ci in np.argsort(-combined):
+        row = dict(candidates[int(ci)][0])
+        qi = int(winning_query[int(ci)])
+        row.update({
+            "z": round(float(combined[int(ci)]), 3),
+            "z_best_query": round(float(z_scores[qi, int(ci)]), 3),
+            "query": queries[qi],
+            "query_index": qi,
+            "best_frame_time": round(float(best_times[qi, int(ci)]), 4),
+            "embedding_profile": req.profile_id,
+            "embedding_mode": req.embedding_mode,
+        })
+        ranked.append(row)
+        if len(ranked) >= max(1, min(int(req.limit), 1000)):
+            break
     return ranked
 
 
@@ -783,6 +928,20 @@ def clip_file(clip_id: int) -> FileResponse:
     return FileResponse(path, media_type="video/mp4", filename=path.name)
 
 
+@app.post("/semantic-match", dependencies=[Depends(auth)])
+def semantic_match(req: SemanticMatchReq) -> dict[str, Any]:
+    try:
+        matches = _semantic_match(req)
+    except FilterQueryError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {
+        "matches": matches,
+        "count": len(matches),
+        "profile_id": req.profile_id,
+        "embedding_mode": req.embedding_mode,
+    }
+
+
 class BundleReq(BaseModel):
     movie_id: Optional[int] = None
     include_frames: bool = False
@@ -870,6 +1029,12 @@ def embedding_profile_bundle(profile_id: str, req: ProfileBundleReq) -> FileResp
                 "duration": float(clip["duration"]),
                 "collection_title": record.get("collection_title") or "",
                 "original_name": record.get("original_name") or "",
+                "shot_size": clip.get("shot_size") or "unknown",
+                "camera_motion_type": clip.get("camera_motion_type") or "unknown",
+                "animation_motion_bucket": clip.get("animation_motion_bucket") or "unknown",
+                "people_count": clip.get("people_count") or "unknown",
+                "moods": clip.get("moods") or [],
+                "tags": clip.get("tags") or [],
                 "artifact": artifact_name,
                 "media": media_name,
                 "frame_count": int(record.get("frame_count") or 0),

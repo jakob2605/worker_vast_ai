@@ -176,6 +176,7 @@ def start_processing(movie_id: int) -> bool:
         thread = _running_jobs.get(movie_id)
         if thread and thread.is_alive():
             return False
+        release_text_embedding_model()
         db.update_movie(movie_id, paused=0, status="queued", progress_stage="queued", error=None)
         thread = threading.Thread(target=process_movie, args=(movie_id,), daemon=True)
         _running_jobs[movie_id] = thread
@@ -195,6 +196,7 @@ def start_semantics_only(
         thread = _running_jobs.get(movie_id)
         if thread and thread.is_alive():
             return False
+        release_text_embedding_model()
         db.update_movie(
             movie_id,
             paused=0,
@@ -227,24 +229,43 @@ def running_movie_ids() -> list[int]:
 
 
 def embed_text_for_profile(profile_id: str, text: str) -> Any:
+    return embed_texts_for_profile(profile_id, [text])[0]
+
+
+_text_analyzer: Any = None
+_text_analyzer_profile = ""
+
+
+def release_text_embedding_model() -> None:
+    global _text_analyzer, _text_analyzer_profile
+    with _semantic_lock:
+        if _text_analyzer is not None:
+            _text_analyzer.close()
+        _text_analyzer = None
+        _text_analyzer_profile = ""
+
+
+def embed_texts_for_profile(profile_id: str, texts: list[str]) -> Any:
+    global _text_analyzer, _text_analyzer_profile
     profile = get_profile(profile_id)
     with _semantic_lock:
-        if profile.model_type == "languagebind":
-            analyzer: SemanticAnalyzer | LanguageBindAnalyzer = LanguageBindAnalyzer(
-                profile,
-                profile.default_embeddings_per_clip,
-            )
-        else:
-            analyzer = SemanticAnalyzer(
-                profile.model_name,
-                profile_id=profile.id,
-                embeddings_per_clip=profile.default_embeddings_per_clip,
-                input_size=profile.input_size,
-            )
-        try:
-            return analyzer.embed_text(text)
-        finally:
-            analyzer.close()
+        if _text_analyzer is None or _text_analyzer_profile != profile.id:
+            if _text_analyzer is not None:
+                _text_analyzer.close()
+            if profile.model_type == "languagebind":
+                _text_analyzer = LanguageBindAnalyzer(
+                    profile,
+                    profile.default_embeddings_per_clip,
+                )
+            else:
+                _text_analyzer = SemanticAnalyzer(
+                    profile.model_name,
+                    profile_id=profile.id,
+                    embeddings_per_clip=profile.default_embeddings_per_clip,
+                    input_size=profile.input_size,
+                )
+            _text_analyzer_profile = profile.id
+        return [_text_analyzer.embed_text(text) for text in texts]
 
 
 def pause_processing(movie_id: int) -> None:
