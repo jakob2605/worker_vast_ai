@@ -81,6 +81,25 @@ class SemanticAnalyzer:
             "error": self._last_error,
         }
 
+    def embed_text(self, text: str) -> np.ndarray:
+        if not self._ensure_model():
+            raise RuntimeError(self._last_error or "SigLIP model is unavailable")
+        inputs = self._processor(text=[text], padding="max_length", return_tensors="pt")
+        inputs = {k: (v.to(self._device) if hasattr(v, "to") else v) for k, v in inputs.items()}
+        with self._torch.no_grad():
+            if hasattr(self._model, "get_text_features"):
+                try:
+                    text_embeds = self._model.get_text_features(**inputs)
+                except TypeError:
+                    allowed = {"input_ids", "attention_mask", "position_ids"}
+                    text_embeds = self._model.get_text_features(**{k: v for k, v in inputs.items() if k in allowed})
+            else:
+                outputs = self._model(**inputs)
+                text_embeds = outputs.text_embeds
+            text_embeds = text_embeds.float()
+            text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+        return text_embeds[0].cpu().numpy().astype("float32")
+
     def _siglip_result(self, frames: list[np.ndarray], clip_id: int, frame_paths: list[str]) -> dict[str, Any]:
         images = [Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)) for frame in frames]
         text_labels = _all_text_labels()

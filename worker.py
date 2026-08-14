@@ -53,6 +53,7 @@ TOKEN = os.getenv("WORKER_TOKEN", "")
 STARTED_AT = time.time()
 SHUTDOWN_TIMER_PID = Path("/workspace/shutdown_timer.pid")
 SHUTDOWN_TIMER_LOG = Path("/workspace/shutdown_timer.log")
+_SEMANTIC_SEARCHER: SemanticAnalyzer | None = None
 
 app = FastAPI(title="Movie clips GPU worker")
 
@@ -67,6 +68,13 @@ def auth(x_worker_token: str = Header(default="")) -> None:
         raise HTTPException(401, "Bad or missing X-Worker-Token")
 
 
+def semantic_searcher() -> SemanticAnalyzer:
+    global _SEMANTIC_SEARCHER
+    if _SEMANTIC_SEARCHER is None:
+        _SEMANTIC_SEARCHER = SemanticAnalyzer()
+    return _SEMANTIC_SEARCHER
+
+
 def clean_filename(name: str, fallback: str = "upload.mp4") -> str:
     cleaned = Path((name or "").replace("\\", "/")).name.strip()
     cleaned = "".join("_" if ch in '<>:"/\\|?*\x00' else ch for ch in cleaned).strip(" .")
@@ -78,6 +86,37 @@ def parse_float(value: str) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def rank_semantic_clips(query: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    import numpy as np
+
+    query_embedding = semantic_searcher().embed_text(query)
+    query_norm = float(np.linalg.norm(query_embedding))
+    if query_norm <= 0:
+        raise HTTPException(500, "Semantic query embedding has zero norm")
+    query_embedding = query_embedding / query_norm
+
+    ranked: list[dict[str, Any]] = []
+    for row in rows:
+        embedding_path = row.get("embedding_path")
+        if not embedding_path:
+            continue
+        path = Path(embedding_path)
+        if path.suffix.lower() != ".npy" or not path.exists():
+            continue
+        try:
+            embedding = np.load(path).astype("float32")
+        except Exception:
+            continue
+        norm = float(np.linalg.norm(embedding))
+        if norm <= 0:
+            continue
+        scored = dict(row)
+        scored["semantic_score"] = round(float(np.dot(query_embedding, embedding / norm)), 4)
+        ranked.append(scored)
+    ranked.sort(key=lambda item: item["semantic_score"], reverse=True)
+    return ranked
 
 
 @app.on_event("startup")
@@ -545,6 +584,7 @@ def clips(
     movie_id: Optional[int] = None,
     collection_title: Optional[str] = None,
     text: Optional[str] = None,
+    semantic_text: Optional[str] = None,
     shot_size: Optional[str] = None,
     camera_motion_type: Optional[str] = None,
     animation_motion_bucket: Optional[str] = None,
@@ -571,14 +611,27 @@ def clips(
         "max_duration": max_duration,
         "has_file": has_file,
     }
-    rows = db.list_clips(filters, limit=limit, offset=offset)
+    semantic_query = (semantic_text or "").strip()
+    if semantic_query:
+        rows = rank_semantic_clips(semantic_query, db.list_clips(filters))
+        total_count = len(rows)
+        downloadable_count = sum(1 for row in rows if row.get("clip_path") and Path(row["clip_path"]).exists())
+        if offset:
+            rows = rows[max(0, int(offset)) :]
+        if limit is not None:
+            rows = rows[: max(0, int(limit))]
+    else:
+        rows = db.list_clips(filters, limit=limit, offset=offset)
+        total_count = db.count_clips(filters)
+        downloadable_count = db.count_clips({**filters, "has_file": True})
     for row in rows:
         path = row.get("clip_path")
         row["size_mb"] = round(Path(path).stat().st_size / 1048576, 2) if path and Path(path).exists() else None
     return {
         "clips": rows,
-        "count": db.count_clips(filters),
-        "downloadable_count": db.count_clips({**filters, "has_file": True}),
+        "count": total_count,
+        "downloadable_count": downloadable_count,
+        "semantic": bool(semantic_query),
         "limit": limit,
         "offset": offset,
     }
