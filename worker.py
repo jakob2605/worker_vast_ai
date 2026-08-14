@@ -227,6 +227,18 @@ def _facet_counts(rows: list[dict[str, Any]], field: str, *, many: bool = False)
     return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0].lower())))
 
 
+def _catalog_facets(rows: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    return {
+        "titles": _facet_counts(rows, "collection_title"),
+        "shot_sizes": _facet_counts(rows, "shot_size"),
+        "camera_motion": _facet_counts(rows, "camera_motion_type"),
+        "animation_motion": _facet_counts(rows, "animation_motion_bucket"),
+        "people": _facet_counts(rows, "people_count"),
+        "moods": _facet_counts(rows, "moods", many=True),
+        "tags": _facet_counts(rows, "tags", many=True),
+    }
+
+
 def _catalog(req: CatalogReq) -> dict[str, Any]:
     filters = {
         "filter_query": req.filter_query,
@@ -234,6 +246,12 @@ def _catalog(req: CatalogReq) -> dict[str, Any]:
         "has_file": True,
     }
     rows = [row for row in db.list_clips(filters) if row.get("status") != "too_short"]
+    available_rows = rows
+    if req.filter_query.strip() or req.text.strip():
+        available_rows = [
+            row for row in db.list_clips({"has_file": True})
+            if row.get("status") != "too_short"
+        ]
     profile: dict[str, Any] | None = None
     complete_ids: set[int] = set()
     if req.profile_id:
@@ -253,15 +271,7 @@ def _catalog(req: CatalogReq) -> dict[str, Any]:
             "available": bool(rows) and complete == len(rows),
         }
 
-    facets = {
-        "titles": _facet_counts(rows, "collection_title"),
-        "shot_sizes": _facet_counts(rows, "shot_size"),
-        "camera_motion": _facet_counts(rows, "camera_motion_type"),
-        "animation_motion": _facet_counts(rows, "animation_motion_bucket"),
-        "people": _facet_counts(rows, "people_count"),
-        "moods": _facet_counts(rows, "moods", many=True),
-        "tags": _facet_counts(rows, "tags", many=True),
-    }
+    facets = _catalog_facets(rows)
     start = max(0, int(req.offset))
     stop = start + max(0, min(int(req.limit), 10000))
     public_rows = []
@@ -293,6 +303,7 @@ def _catalog(req: CatalogReq) -> dict[str, Any]:
         "limit": req.limit,
         "filter_query": req.filter_query,
         "facets": facets,
+        "available_facets": _catalog_facets(available_rows),
         "profile": profile,
         "duration": {
             "min": round(min(durations), 2) if durations else 0,
@@ -1022,6 +1033,36 @@ def clip_file(clip_id: int) -> FileResponse:
     if not path.exists():
         raise HTTPException(404, "Clip file missing on disk")
     return FileResponse(path, media_type="video/mp4", filename=path.name)
+
+
+def _representative_frame(clip: dict[str, Any]) -> Path | None:
+    metadata_path = Path(clip.get("metadata_path") or "")
+    candidates: list[Path] = []
+    if metadata_path.is_file():
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            candidates = [Path(value) for value in metadata.get("representative_frames") or []]
+        except (OSError, json.JSONDecodeError, TypeError):
+            candidates = []
+    existing = [path for path in candidates if path.is_file()]
+    if not existing:
+        existing = sorted(FRAMES_DIR.glob(f"*/clip_{clip['id']:06d}/frame_*.jpg"))
+    return existing[len(existing) // 2] if existing else None
+
+
+@app.get("/clips/{clip_id}/thumbnail", dependencies=[Depends(auth)])
+def clip_thumbnail(clip_id: int) -> FileResponse:
+    clip = db.get_clip(clip_id)
+    if not clip:
+        raise HTTPException(404, "Clip not found")
+    frame = _representative_frame(clip)
+    if not frame:
+        raise HTTPException(404, "Representative frame not found")
+    return FileResponse(
+        frame,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @app.post("/semantic-match", dependencies=[Depends(auth)])
