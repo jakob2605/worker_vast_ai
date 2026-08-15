@@ -1250,6 +1250,7 @@ def storage() -> dict[str, Any]:
 class CloudBackupReq(BaseModel):
     include_movies: bool = False
     include_frames: bool = False
+    zip_archive: bool = False
 
 
 class CloudRestoreReq(BaseModel):
@@ -1273,6 +1274,7 @@ def cloud_backup_start(req: CloudBackupReq) -> dict[str, Any]:
         create_snapshot,
         include_movies=req.include_movies,
         include_frames=req.include_frames,
+        zip_archive=req.zip_archive,
     )
     return {"job_id": job_id, "laptop_may_disconnect": True}
 

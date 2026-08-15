@@ -25,6 +25,15 @@ MOOD_LABELS = ["calm", "tense", "sad", "lonely", "romantic", "dark", "bright", "
 SETTING_LABELS = ["indoor", "outdoor", "city", "nature", "room", "vehicle", "school", "restaurant", "night", "day"]
 
 
+def _load_saved_frames(paths: list[str]) -> list[np.ndarray]:
+    frames: list[np.ndarray] = []
+    for value in paths:
+        frame = cv2.imread(str(value))
+        if frame is not None:
+            frames.append(frame)
+    return frames
+
+
 class SemanticAnalyzer:
     def __init__(
         self,
@@ -55,10 +64,13 @@ class SemanticAnalyzer:
         end_time: float,
         *,
         movie_id: int | None = None,
+        existing_frame_paths: list[str] | None = None,
     ) -> dict[str, Any]:
         total_started = time.perf_counter()
         decode_started = time.perf_counter()
-        frames = sample_frames(video_path, start_time, end_time, self.embeddings_per_clip, self.input_size)
+        frames = _load_saved_frames(existing_frame_paths or [])
+        if not frames:
+            frames = sample_frames(video_path, start_time, end_time, self.embeddings_per_clip, self.input_size)
         frame_times = _sample_times(start_time, end_time, len(frames))
         decode_s = time.perf_counter() - decode_started
         frame_save_started = time.perf_counter()

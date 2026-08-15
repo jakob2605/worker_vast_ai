@@ -395,11 +395,6 @@ def reset_semantic_outputs(movie_id: int) -> dict[str, int]:
                 if path.exists():
                     path.unlink(missing_ok=True)
                     removed += 1
-        frame_dir = FRAMES_DIR / f"clip_{int(clip['id']):06d}"
-        if frame_dir.exists():
-            shutil.rmtree(frame_dir, ignore_errors=True)
-            removed += 1
-
         if clip["status"] != "too_short":
             db.update_clip(
                 int(clip["id"]),
@@ -527,8 +522,6 @@ def process_semantics_only(
     )
     try:
         source = Path(movie["path"])
-        if not source.exists():
-            raise FileNotFoundError(f"Source movie is missing: {source}")
         _timed_call(
             movie_id,
             "semantic_indexing",
@@ -654,6 +647,16 @@ def _analyze_missing_semantics(movie_id: int, source: Path) -> None:
     )
 
 
+def _saved_frame_paths(clip_id: int) -> list[str]:
+    """Return previously decoded representative frames, preferring SigLIP2 224."""
+    preferred = FRAMES_DIR / DEFAULT_PROFILE_ID / f"clip_{clip_id:06d}"
+    candidates = sorted(preferred.glob("frame_*.jpg"))
+    if candidates:
+        return [str(path) for path in candidates]
+    candidates = sorted(FRAMES_DIR.glob(f"*/clip_{clip_id:06d}/frame_*.jpg"))
+    return [str(path) for path in candidates]
+
+
 def _analyze_embedding_profile(
     movie_id: int,
     source: Path,
@@ -732,12 +735,16 @@ def _analyze_embedding_profile(
                 )
                 clip_started = time.perf_counter()
                 try:
+                    saved_frames = _saved_frame_paths(clip_id)
+                    analyze_kwargs = {"movie_id": movie_id}
+                    if profile.model_type == "siglip2":
+                        analyze_kwargs["existing_frame_paths"] = saved_frames
                     result = analyzer.analyze_clip(
                         source,
                         clip_id,
                         float(clip["start_time"]),
                         float(clip["end_time"]),
-                        movie_id=movie_id,
+                        **analyze_kwargs,
                     )
                     timings = result.pop("_timings", {})
                     if result.get("semantic_model") == "fallback-cv":
