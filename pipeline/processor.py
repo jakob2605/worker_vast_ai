@@ -5,8 +5,10 @@ import re
 import shutil
 import threading
 import time
+from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import uuid
 from urllib.parse import unquote, urlparse
@@ -40,6 +42,38 @@ _job_lock = threading.Lock()
 _running_jobs: dict[int, threading.Thread] = {}
 _download_link_lock = threading.Lock()
 _semantic_lock = threading.RLock()
+_semantic_queue_condition = threading.Condition()
+_semantic_queue: deque[str] = deque()
+_active_semantic_ticket = ""
+
+
+@contextmanager
+def _semantic_queue_slot(movie_id: int, profile_label: str) -> Iterable[float]:
+    global _active_semantic_ticket
+    ticket = uuid.uuid4().hex
+    queued_at = time.perf_counter()
+    with _semantic_queue_condition:
+        _semantic_queue.append(ticket)
+        while _active_semantic_ticket or _semantic_queue[0] != ticket:
+            position = list(_semantic_queue).index(ticket) + (1 if _active_semantic_ticket else 0)
+            try:
+                db.update_movie(
+                    movie_id,
+                    progress_stage="semantic_indexing",
+                    progress_detail=f"Queued for GPU slot: {profile_label} ({position} ahead)",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            _semantic_queue_condition.wait(timeout=2.0)
+        _semantic_queue.popleft()
+        _active_semantic_ticket = ticket
+    try:
+        yield time.perf_counter() - queued_at
+    finally:
+        with _semantic_queue_condition:
+            if _active_semantic_ticket == ticket:
+                _active_semantic_ticket = ""
+            _semantic_queue_condition.notify_all()
 
 
 def _timed_call(movie_id: int, stage: str, operation: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -636,18 +670,22 @@ def _analyze_embedding_profile(
     movie = db.get_movie(movie_id) or {}
     clips = [clip for clip in db.list_clips({"movie_id": movie_id}) if clip["status"] != "too_short"]
     analyzer: SemanticAnalyzer | LanguageBindAnalyzer
-    queue_started = time.perf_counter()
     db.update_movie(
         movie_id,
         progress_stage="semantic_indexing",
-        progress_detail=f"Waiting for GPU slot: {profile.label}",
+        progress_detail=f"Queued for GPU slot: {profile.label}",
     )
-    with _semantic_lock:
+    with _semantic_queue_slot(movie_id, profile.label) as queue_wait_s, _semantic_lock:
         timing_event(
             "semantic_gpu_acquired",
             movie_id=movie_id,
             profile_id=profile.id,
-            queue_wait_s=round(time.perf_counter() - queue_started, 4),
+            queue_wait_s=round(queue_wait_s, 4),
+        )
+        db.update_movie(
+            movie_id,
+            progress_stage="semantic_indexing",
+            progress_detail=f"{profile.label}: starting",
         )
         release_text_embedding_model()
         if _is_paused(movie_id):
