@@ -426,6 +426,25 @@ def _profile_embedding_index(profile_id: str) -> dict[str, Any]:
 def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
     import numpy as np
 
+    started = time.perf_counter()
+
+    def mark(label: str, since: float | None = None, **extra: Any) -> None:
+        elapsed = time.perf_counter() - started
+        duration = f" ({time.perf_counter() - since:.4f}s)" if since is not None else ""
+        details = " ".join(f"{key}={value!r}" for key, value in extra.items())
+        print(
+            f"SEM_MATCH {label} +{elapsed:.4f}s{duration}"
+            f"{(' ' + details) if details else ''}",
+            flush=True,
+        )
+
+    mark(
+        "start",
+        profile=req.profile_id,
+        queries=len(req.queries),
+        clip_ids=len(req.clip_ids),
+        mode=req.embedding_mode,
+    )
     get_profile(req.profile_id)
     if req.embedding_mode not in {"mean_only", "mean_and_frames"}:
         raise HTTPException(400, "embedding_mode must be mean_only or mean_and_frames")
@@ -434,8 +453,10 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
         raise HTTPException(400, "queries must contain at least one non-empty string")
     anchor = req.anchor.strip()
     texts = queries + ([anchor] if anchor else [])
+    stage = time.perf_counter()
     vectors = np.asarray(embed_texts_for_profile(req.profile_id, texts), dtype="float32")
     vectors /= np.maximum(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-9)
+    mark("text_embedding_done", stage, vectors=vectors.shape)
 
     filters = {
         "movie_id": req.movie_id,
@@ -443,7 +464,15 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
         "filter_query": req.filter_query,
         "has_file": True,
     }
+    stage = time.perf_counter()
     embedding_index = _profile_embedding_index(req.profile_id)
+    mark(
+        "embedding_index_done",
+        stage,
+        clips=len(embedding_index["clip_ids"]),
+        frames=len(embedding_index["frames"]),
+        dimension=embedding_index["means"].shape[1] if embedding_index["means"].ndim == 2 else 0,
+    )
     clip_ids = embedding_index["clip_ids"]
     clip_index_by_id = {int(clip_id): index for index, clip_id in enumerate(clip_ids)}
     allowed_ids = {int(clip_id) for clip_id in req.clip_ids if int(clip_id) > 0}
@@ -461,10 +490,14 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
         candidate_indexes.append(index)
 
     if not candidate_rows:
+        mark("done_empty", candidates=0)
         return []
+    mark("candidates_done", candidates=len(candidate_rows))
     candidate_indexes_array = np.asarray(candidate_indexes, dtype="int64")
     means = embedding_index["means"][candidate_indexes_array]
+    stage = time.perf_counter()
     scores = np.asarray(vectors[:len(queries)], dtype="float32") @ means.T
+    mark("mean_scores_done", stage, shape=scores.shape)
     best_times = np.zeros((len(queries), len(candidate_rows)), dtype="float32")
     frame_weight = 0.0 if req.embedding_mode == "mean_only" else min(1.0, max(0.0, req.frame_weight))
     if frame_weight and embedding_index["frames"].size:
@@ -477,6 +510,7 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
         frame_owners = frame_owner_local[frame_mask]
         frame_value_times = embedding_index["frame_times"][frame_mask]
         if frame_values.size:
+            stage = time.perf_counter()
             for qi, query in enumerate(vectors[:len(queries)]):
                 frame_scores = frame_values @ query
                 best_frame_scores = np.full(len(candidate_rows), -np.inf, dtype="float32")
@@ -494,12 +528,18 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
                     if frame_score > best_score[owner]:
                         best_score[owner] = frame_score
                         best_times[qi, owner] = frame_time
+            mark("frame_scores_done", stage, frames=len(frame_values), queries=len(queries))
+    else:
+        mark("frame_scores_skipped", reason="mean_only_or_no_frames")
+    stage = time.perf_counter()
     means = scores.mean(axis=1, keepdims=True)
     stds = scores.std(axis=1, keepdims=True)
     z_scores = (scores - means) / np.maximum(stds, 1e-6)
     winning_query = z_scores.argmax(axis=0)
     combined = z_scores.max(axis=0)
+    mark("z_scores_done", stage)
     if anchor:
+        stage = time.perf_counter()
         anchor_vector = vectors[-1]
         anchor_scores = means @ anchor_vector
         if frame_weight and embedding_index["frames"].size:
@@ -511,7 +551,9 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
         anchor_z = (anchor_scores - anchor_scores.mean()) / max(float(anchor_scores.std()), 1e-6)
         weight = min(1.0, max(0.0, req.anchor_weight))
         combined = (1.0 - weight) * combined + weight * anchor_z
+        mark("anchor_done", stage)
 
+    stage = time.perf_counter()
     ranked: list[dict[str, Any]] = []
     for ci in np.argsort(-combined):
         row = dict(candidate_rows[int(ci)])
@@ -528,6 +570,7 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
         ranked.append(row)
         if len(ranked) >= max(1, min(int(req.limit), 10000)):
             break
+    mark("done", stage, results=len(ranked), total=time.perf_counter() - started)
     return ranked
 
 
