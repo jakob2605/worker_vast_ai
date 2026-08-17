@@ -718,6 +718,37 @@ def update() -> dict[str, Any]:
     return result
 
 
+@app.post("/restart", dependencies=[Depends(auth)])
+def restart() -> dict[str, Any]:
+    """Restart the worker process without pulling or changing any code."""
+    with _CLOUD_JOBS_LOCK:
+        active_cloud_jobs = [
+            job["id"] for job in _CLOUD_JOBS.values()
+            if job.get("status") in {"queued", "running"}
+        ]
+    active_movie_jobs = running_movie_ids()
+    if active_cloud_jobs or active_movie_jobs:
+        raise HTTPException(
+            409,
+            "Cannot restart while jobs are active: "
+            f"cloud={active_cloud_jobs}, movies={active_movie_jobs}",
+        )
+
+    port = os.getenv("WORKER_PORT", "8100")
+
+    def relaunch() -> None:
+        time.sleep(0.5)  # let this response flush first
+        worker_dir = Path(__file__).resolve().parent
+        os.chdir(worker_dir)
+        os.execv(
+            sys.executable,
+            [sys.executable, "-m", "uvicorn", "worker:app", "--host", "0.0.0.0", "--port", port],
+        )
+
+    threading.Thread(target=relaunch, daemon=True).start()
+    return {"restarting": True, "message": "Worker restart scheduled"}
+
+
 class ShutdownReq(BaseModel):
     minutes: int
 
