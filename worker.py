@@ -71,7 +71,13 @@ SHUTDOWN_TIMER_LOG = Path("/workspace/shutdown_timer.log")
 app = FastAPI(title="Movie clips GPU worker")
 _CLOUD_JOBS: dict[str, dict[str, Any]] = {}
 _CLOUD_JOBS_LOCK = threading.Lock()
-_EMBEDDING_CACHE: dict[str, Any] = {"profile_id": "", "signature": (), "vectors": {}}
+_EMBEDDING_CACHE: dict[str, Any] = {
+    "profile_id": "",
+    "signature": (),
+    "vectors": {},
+    "index_signature": (),
+    "index": None,
+}
 _EMBEDDING_CACHE_LOCK = threading.Lock()
 
 
@@ -361,8 +367,60 @@ def _profile_embedding_vectors(profile_id: str) -> dict[int, tuple[Any, Any, Any
             if frames.size:
                 frames /= np.maximum(np.linalg.norm(frames, axis=1, keepdims=True), 1e-9)
             vectors[int(record["clip_id"])] = (mean, frames, times)
-        _EMBEDDING_CACHE.update(profile_id=profile_id, signature=signature, vectors=vectors)
+        _EMBEDDING_CACHE.update(
+            profile_id=profile_id,
+            signature=signature,
+            vectors=vectors,
+            index_signature=(),
+            index=None,
+        )
         return vectors
+
+
+def _profile_embedding_index(profile_id: str) -> dict[str, Any]:
+    """Build a vectorized in-memory search index from the existing NPZ cache."""
+    import numpy as np
+
+    vectors = _profile_embedding_vectors(profile_id)
+    with _EMBEDDING_CACHE_LOCK:
+        signature = _EMBEDDING_CACHE["signature"]
+        if (
+            _EMBEDDING_CACHE["index"] is not None
+            and _EMBEDDING_CACHE["profile_id"] == profile_id
+            and _EMBEDDING_CACHE["index_signature"] == signature
+        ):
+            return _EMBEDDING_CACHE["index"]
+
+        clip_ids = np.asarray(sorted(vectors), dtype="int64")
+        means = np.stack([vectors[int(clip_id)][0] for clip_id in clip_ids]).astype(
+            "float32", copy=False
+        ) if len(clip_ids) else np.zeros((0, 0), dtype="float32")
+
+        frame_blocks: list[np.ndarray] = []
+        frame_owners: list[np.ndarray] = []
+        frame_times: list[np.ndarray] = []
+        for owner, clip_id in enumerate(clip_ids):
+            frames = np.asarray(vectors[int(clip_id)][1], dtype="float32")
+            times = np.asarray(vectors[int(clip_id)][2], dtype="float32").reshape(-1)
+            if frames.ndim != 2 or not frames.size:
+                continue
+            frame_blocks.append(frames)
+            frame_owners.append(np.full(frames.shape[0], owner, dtype="int64"))
+            frame_times.append(times[:frames.shape[0]])
+
+        dimension = means.shape[1] if means.ndim == 2 else 0
+        index = {
+            "clip_ids": clip_ids,
+            "means": means,
+            "frames": np.concatenate(frame_blocks, axis=0) if frame_blocks else
+                      np.zeros((0, dimension), dtype="float32"),
+            "frame_owners": np.concatenate(frame_owners) if frame_owners else
+                            np.zeros((0,), dtype="int64"),
+            "frame_times": np.concatenate(frame_times) if frame_times else
+                           np.zeros((0,), dtype="float32"),
+        }
+        _EMBEDDING_CACHE.update(index_signature=signature, index=index)
+        return index
 
 
 def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
@@ -385,36 +443,57 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
         "filter_query": req.filter_query,
         "has_file": True,
     }
-    available_vectors = _profile_embedding_vectors(req.profile_id)
+    embedding_index = _profile_embedding_index(req.profile_id)
+    clip_ids = embedding_index["clip_ids"]
+    clip_index_by_id = {int(clip_id): index for index, clip_id in enumerate(clip_ids)}
     allowed_ids = {int(clip_id) for clip_id in req.clip_ids if int(clip_id) > 0}
-    candidates: list[tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray]] = []
+    candidate_rows: list[dict[str, Any]] = []
+    candidate_indexes: list[int] = []
     for row in db.list_clips(filters):
         if allowed_ids and int(row["id"]) not in allowed_ids:
             continue
-        cached = available_vectors.get(int(row["id"]))
-        if cached is None:
+        index = clip_index_by_id.get(int(row["id"]))
+        if index is None:
             continue
-        mean, frames, times = cached
-        if mean.size != vectors.shape[1]:
+        if embedding_index["means"][index].size != vectors.shape[1]:
             continue
-        candidates.append((row, mean, frames, times))
+        candidate_rows.append(row)
+        candidate_indexes.append(index)
 
-    if not candidates:
+    if not candidate_rows:
         return []
-    scores = np.zeros((len(queries), len(candidates)), dtype="float32")
-    best_times = np.zeros((len(queries), len(candidates)), dtype="float32")
+    candidate_indexes_array = np.asarray(candidate_indexes, dtype="int64")
+    means = embedding_index["means"][candidate_indexes_array]
+    scores = np.asarray(vectors[:len(queries)], dtype="float32") @ means.T
+    best_times = np.zeros((len(queries), len(candidate_rows)), dtype="float32")
     frame_weight = 0.0 if req.embedding_mode == "mean_only" else min(1.0, max(0.0, req.frame_weight))
-    for qi, query in enumerate(vectors[:len(queries)]):
-        for ci, (_, mean, frames, times) in enumerate(candidates):
-            mean_score = float(mean @ query)
-            frame_score = mean_score
-            if frame_weight and frames.size:
-                frame_scores = frames @ query
-                best_index = int(np.argmax(frame_scores))
-                frame_score = max(mean_score, float(frame_scores[best_index]))
-                if best_index < times.size:
-                    best_times[qi, ci] = float(times[best_index])
-            scores[qi, ci] = (1.0 - frame_weight) * mean_score + frame_weight * frame_score
+    if frame_weight and embedding_index["frames"].size:
+        positions = np.full(len(clip_ids), -1, dtype="int64")
+        positions[candidate_indexes_array] = np.arange(len(candidate_rows), dtype="int64")
+        frame_owner_global = embedding_index["frame_owners"]
+        frame_owner_local = positions[frame_owner_global]
+        frame_mask = frame_owner_local >= 0
+        frame_values = embedding_index["frames"][frame_mask]
+        frame_owners = frame_owner_local[frame_mask]
+        frame_value_times = embedding_index["frame_times"][frame_mask]
+        if frame_values.size:
+            for qi, query in enumerate(vectors[:len(queries)]):
+                frame_scores = frame_values @ query
+                best_frame_scores = np.full(len(candidate_rows), -np.inf, dtype="float32")
+                np.maximum.at(best_frame_scores, frame_owners, frame_scores)
+                best_frame_scores = np.maximum(best_frame_scores, scores[qi])
+                scores[qi] = (1.0 - frame_weight) * scores[qi] + frame_weight * best_frame_scores
+
+                # Keep the exact best-frame timestamp for the picker. This
+                # small loop is only for timestamps; score calculation above
+                # is fully vectorized.
+                best_score = np.full(len(candidate_rows), -np.inf, dtype="float32")
+                for frame_score, owner, frame_time in zip(
+                    frame_scores, frame_owners, frame_value_times
+                ):
+                    if frame_score > best_score[owner]:
+                        best_score[owner] = frame_score
+                        best_times[qi, owner] = frame_time
     means = scores.mean(axis=1, keepdims=True)
     stds = scores.std(axis=1, keepdims=True)
     z_scores = (scores - means) / np.maximum(stds, 1e-6)
@@ -422,18 +501,20 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
     combined = z_scores.max(axis=0)
     if anchor:
         anchor_vector = vectors[-1]
-        anchor_scores = np.zeros(len(candidates), dtype="float32")
-        for ci, (_, mean, frames, _) in enumerate(candidates):
-            mean_score = float(mean @ anchor_vector)
-            frame_score = max(mean_score, float(np.max(frames @ anchor_vector))) if frame_weight and frames.size else mean_score
-            anchor_scores[ci] = (1.0 - frame_weight) * mean_score + frame_weight * frame_score
+        anchor_scores = means @ anchor_vector
+        if frame_weight and embedding_index["frames"].size:
+            anchor_frame_scores = embedding_index["frames"] @ anchor_vector
+            best_anchor_frames = np.full(len(clip_ids), -np.inf, dtype="float32")
+            np.maximum.at(best_anchor_frames, embedding_index["frame_owners"], anchor_frame_scores)
+            best_anchor_frames = np.maximum(best_anchor_frames[candidate_indexes_array], anchor_scores)
+            anchor_scores = (1.0 - frame_weight) * anchor_scores + frame_weight * best_anchor_frames
         anchor_z = (anchor_scores - anchor_scores.mean()) / max(float(anchor_scores.std()), 1e-6)
         weight = min(1.0, max(0.0, req.anchor_weight))
         combined = (1.0 - weight) * combined + weight * anchor_z
 
     ranked: list[dict[str, Any]] = []
     for ci in np.argsort(-combined):
-        row = dict(candidates[int(ci)][0])
+        row = dict(candidate_rows[int(ci)])
         qi = int(winning_query[int(ci)])
         row.update({
             "z": round(float(combined[int(ci)]), 3),
