@@ -18,6 +18,23 @@ if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v rclone >/dev/null 2>&1; t
   apt-get update -qq && apt-get install -y -qq ffmpeg rclone python3-venv >>"$LOG" 2>&1
 fi
 
+# ----- Configure rclone from environment variable -----
+if [ -n "${RCLONE_CONFIG_B64:-}" ]; then
+  echo "Setting up rclone config from environment variable" | tee -a "$LOG"
+  mkdir -p ~/.config/rclone
+  echo "$RCLONE_CONFIG_B64" | base64 -d > ~/.config/rclone/rclone.conf
+  chmod 600 ~/.config/rclone/rclone.conf
+
+  # Test the remote (same command you ran manually)
+  if rclone lsd gdrive:VastAIProgram >/dev/null 2>&1; then
+    echo "rclone remote 'gdrive' is ready and can access VastAIProgram" | tee -a "$LOG"
+  else
+    echo "WARNING: rclone remote test failed - check the config" | tee -a "$LOG"
+  fi
+else
+  echo "No RCLONE_CONFIG_B64 provided - rclone remote not configured" | tee -a "$LOG"
+fi
+
 mkdir -p "$WORKER_DIR" "$LIBRARY_DIR"
 
 # Preferred code delivery when SSH-based `vastai copy` is not an option:

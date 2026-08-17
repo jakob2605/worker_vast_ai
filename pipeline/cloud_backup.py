@@ -184,8 +184,8 @@ def create_snapshot(
 
 
 def restore_snapshot(snapshot_id: str, *, progress: Progress | None = None) -> dict[str, Any]:
+    snapshots = list_snapshots()
     if snapshot_id == "latest":
-        snapshots = list_snapshots()
         if not snapshots:
             raise RuntimeError("No Google Drive snapshots are available")
         snapshot_id = snapshots[0]["id"]
@@ -195,6 +195,11 @@ def restore_snapshot(snapshot_id: str, *, progress: Progress | None = None) -> d
     if not ready["ready"]:
         raise RuntimeError(ready["error"] or f"rclone remote {remote_root()} is not configured")
 
+    snapshot_info = next((item for item in snapshots if item["id"] == snapshot_id), None)
+    if snapshot_info is None:
+        raise RuntimeError(f"Google Drive snapshot not found: {snapshot_id}")
+    is_archive = bool(snapshot_info.get("archive"))
+
     staging = LIBRARY_DIR.parent / f".{LIBRARY_DIR.name}.restore-{snapshot_id}"
     shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True, exist_ok=True)
@@ -203,22 +208,26 @@ def restore_snapshot(snapshot_id: str, *, progress: Progress | None = None) -> d
     archive = staging.parent / f".{LIBRARY_DIR.name}.restore-{snapshot_id}.zip"
     archive.unlink(missing_ok=True)
     try:
-        _run(["copyto", f"{remote_root()}/snapshots/{snapshot_id}.zip", str(archive), "--checksum"])
-        if progress:
-            progress("Snapshot-Archiv wird entpackt", 0.5)
-        _extract_zip_safely(archive, staging)
-    except RuntimeError:
-        archive.unlink(missing_ok=True)
-        _run([
-            "copy",
-            f"{remote_root()}/snapshots/{snapshot_id}",
-            str(staging),
-            "--checksum",
-            "--transfers",
-            "8",
-            "--checkers",
-            "16",
-        ])
+        if is_archive:
+            if progress:
+                progress("Google Drive: Snapshot-Archiv wird geladen", 0.1)
+            _run(["copyto", f"{remote_root()}/snapshots/{snapshot_id}.zip", str(archive), "--checksum"])
+            if progress:
+                progress("Snapshot-Archiv wird entpackt", 0.5)
+            _extract_zip_safely(archive, staging)
+        else:
+            if progress:
+                progress("Google Drive: Snapshot-Ordner wird kopiert", 0.1)
+            _run([
+                "copy",
+                f"{remote_root()}/snapshots/{snapshot_id}",
+                str(staging),
+                "--checksum",
+                "--transfers",
+                "8",
+                "--checkers",
+                "16",
+            ])
     finally:
         archive.unlink(missing_ok=True)
     manifest_path = staging / "manifest.json"
