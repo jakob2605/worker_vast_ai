@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -157,6 +158,12 @@ def _rclone_upload(
             "--checkers", "4",
             "--retries", "5",
             "--low-level-retries", "10",
+            # The default SFTP request size is very small.  Larger requests
+            # reduce round trips substantially on a cross-server migration.
+            # Keep both values configurable because some SSH/SFTP servers
+            # reject larger requests or too many outstanding operations.
+            "--sftp-chunk-size", os.getenv("MIGRATION_SFTP_CHUNK_SIZE", "255k"),
+            "--sftp-concurrency", os.getenv("MIGRATION_SFTP_CONCURRENCY", "128"),
         ],
         capture_output=True,
         text=True,
