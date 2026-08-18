@@ -186,8 +186,8 @@ def migrate_to_destination(
 ) -> dict[str, Any]:
     if not target_ssh_host or not target_url or not ssh_private_key.strip():
         raise MigrationError("Destination URL, SSH host and migration key are required")
-    if not 256 <= chunk_size_mb <= 4096:
-        raise MigrationError("chunk_size_mb must be between 256 and 4096")
+    if not 64 <= chunk_size_mb <= 4096:
+        raise MigrationError("chunk_size_mb must be between 64 and 4096")
     migration_id = migration_id or f"mig-{time.strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
     chunk_bytes = chunk_size_mb * 1024 * 1024
     source_free = shutil.disk_usage(LIBRARY_DIR.parent).free
