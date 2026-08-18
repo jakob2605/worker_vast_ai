@@ -70,6 +70,8 @@ GET  /embedding-profiles     profile registry and completeness
 POST /jobs/{id}/semantics    generate one selected profile non-destructively
 POST /embedding-profiles/{profile}/bundle  TikTokGen transfer bundle
 GET/POST /backups            Google Drive snapshots and restore jobs
+POST /migrations             direct server-to-server migration via rclone/SFTP
+GET  /migrations/jobs/{id}   migration progress
 GET  /storage                disk used by movies/clips/frames/embeddings
 POST /purge                  delete source movies, keep clips
 ```

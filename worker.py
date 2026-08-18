@@ -47,6 +47,16 @@ from pipeline.cloud_backup import (  # noqa: E402
     rclone_ready,
     restore_snapshot,
 )
+from pipeline.migration import (  # noqa: E402
+    MigrationError,
+    MIGRATION_FORMAT,
+    destination_status,
+    finalize_destination,
+    migrate_to_destination,
+    prepare_destination,
+    pending_source_migrations,
+    receive_chunk,
+)
 from pipeline.processor import (  # noqa: E402
     embed_text_for_profile,
     embed_texts_for_profile,
@@ -578,6 +588,11 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
 def startup() -> None:
     ensure_library_dirs()
     db.init_db()
+    # A UI disconnect or worker restart must not lose an in-progress migration.
+    # The request state is local and mode 0600; it is removed only after the
+    # destination has validated and activated the new library.
+    for request in pending_source_migrations():
+        start_cloud_job("migration", migrate_to_destination, **request)
 
 
 # --------------------------------------------------------------------------
@@ -616,6 +631,7 @@ def health() -> dict[str, Any]:
         },
         "auth_required": bool(TOKEN),
         "embedding_profiles": [profile.to_dict() for profile in BUILTIN_PROFILES],
+        "migration": {"supported": True, "format": MIGRATION_FORMAT},
     }
 
 
@@ -756,12 +772,14 @@ class ShutdownReq(BaseModel):
 @app.post("/shutdown-later", dependencies=[Depends(auth)])
 def shutdown_later(req: ShutdownReq) -> dict[str, Any]:
     """
-    Schedule the instance/container to stop from inside the box.
+    Schedule the Vast instance to stop from inside the box.
 
     The timer is a detached shell process, so it continues even if the local
-    dashboard or the worker process exits. This is intended as a cost guard;
-    persistent disk charges may still apply depending on the Vast instance
-    state after the container stops.
+    dashboard or the worker process exits. Vast injects a restricted
+    CONTAINER_API_KEY and CONTAINER_ID into instances; when available, the
+    timer uses Vast's instance-state API, which stops compute billing while
+    preserving the instance data. Older images without those variables use a
+    best-effort container shutdown fallback.
     """
     minutes = int(req.minutes)
     if minutes < 1 or minutes > 10080:
@@ -780,12 +798,28 @@ def shutdown_later(req: ShutdownReq) -> dict[str, Any]:
     seconds = minutes * 60
     due_at = time.time() + seconds
     due_iso = datetime.fromtimestamp(due_at, timezone.utc).isoformat(timespec="seconds")
+    has_vast_api = bool(os.getenv("CONTAINER_API_KEY") and os.getenv("CONTAINER_ID"))
     script = f"""
 set -eu
 echo "scheduled stop for {due_iso} after {minutes} minute(s)" >> "{SHUTDOWN_TIMER_LOG}"
 sleep {seconds}
-echo "stopping instance/container at $(date -u)" >> "{SHUTDOWN_TIMER_LOG}"
+echo "stopping Vast instance at $(date -u)" >> "{SHUTDOWN_TIMER_LOG}"
 sync || true
+instance_id="${{CONTAINER_ID:-${{VAST_INSTANCE_ID:-}}}}"
+if [ -n "${{CONTAINER_API_KEY:-}}" ] && [ -n "$instance_id" ] && echo "$instance_id" | grep -Eq '^[0-9]+$'; then
+  if curl -fsS --retry 8 --retry-delay 2 --max-time 30 \\
+      -X PUT \\
+      -H "Authorization: Bearer $CONTAINER_API_KEY" \\
+      -H "Content-Type: application/json" \\
+      -d '{{"state":"stopped"}}' \\
+      "https://console.vast.ai/api/v0/instances/$instance_id/" >> "{SHUTDOWN_TIMER_LOG}" 2>&1; then
+    echo "Vast API stop request succeeded for instance $instance_id" >> "{SHUTDOWN_TIMER_LOG}"
+    exit 0
+  fi
+  echo "Vast API stop request failed; using container fallback" >> "{SHUTDOWN_TIMER_LOG}"
+else
+  echo "Vast instance API credentials unavailable; using container fallback" >> "{SHUTDOWN_TIMER_LOG}"
+fi
 shutdown -h now >> "{SHUTDOWN_TIMER_LOG}" 2>&1 || true
 poweroff >> "{SHUTDOWN_TIMER_LOG}" 2>&1 || true
 kill -TERM 1 >> "{SHUTDOWN_TIMER_LOG}" 2>&1 || true
@@ -808,7 +842,12 @@ kill -KILL 1 >> "{SHUTDOWN_TIMER_LOG}" 2>&1 || true
         "due_at_utc": due_iso,
         "pid": proc.pid,
         "log": str(SHUTDOWN_TIMER_LOG),
-        "note": "Timer runs on the Vast instance; your laptop does not need to stay on.",
+        "method": "vast-instance-api" if has_vast_api else "container-fallback",
+        "note": (
+            "Timer runs on the Vast instance; your laptop does not need to stay on."
+            if has_vast_api else
+            "Vast instance credentials were not detected; using a best-effort container fallback."
+        ),
     }
 
 
@@ -1413,6 +1452,37 @@ class CloudRestoreReq(BaseModel):
     confirmation: str
 
 
+class MigrationStartReq(BaseModel):
+    target_url: str
+    target_token: str = ""
+    target_ssh_host: str
+    target_ssh_port: int
+    target_ssh_user: str = "root"
+    ssh_private_key: str
+    target_path: str = "/workspace"
+    chunk_size_mb: int = 1024
+    include_movies: bool = True
+    include_clips: bool = True
+    include_frames: bool = True
+    include_embeddings: bool = True
+    include_metadata: bool = True
+    migration_id: str | None = None
+
+
+class MigrationPrepareReq(BaseModel):
+    migration_id: str
+    manifest: dict[str, Any]
+    target_path: str = "/workspace"
+    confirmation: str
+
+
+class MigrationChunkReq(BaseModel):
+    name: str
+    remote_path: str
+    sha256: str
+    size: int
+
+
 @app.get("/backups", dependencies=[Depends(auth)])
 def cloud_backups() -> dict[str, Any]:
     return {
@@ -1453,6 +1523,102 @@ def cloud_restore_start(req: CloudRestoreReq) -> dict[str, Any]:
         raise HTTPException(409, f"Pause active movie jobs before restore: {active}")
     job_id = start_cloud_job("restore", restore_snapshot, req.snapshot_id)
     return {"job_id": job_id, "warning": "The library will switch atomically after integrity validation."}
+
+
+@app.post("/migrations", dependencies=[Depends(auth)])
+def migration_start(req: MigrationStartReq) -> dict[str, Any]:
+    """Start a direct source-to-destination migration.
+
+    The private key is used only by the background job to create a temporary
+    rclone SFTP config.  It is never included in job status or result output.
+    """
+    if any(
+        job.get("status") in {"queued", "running"}
+        for job in _CLOUD_JOBS.values()
+    ):
+        raise HTTPException(409, "Another backup, restore, or migration is already active")
+    job_id = start_cloud_job(
+        "migration",
+        migrate_to_destination,
+        target_url=req.target_url,
+        target_token=req.target_token,
+        target_ssh_host=req.target_ssh_host,
+        target_ssh_port=req.target_ssh_port,
+        target_ssh_user=req.target_ssh_user,
+        ssh_private_key=req.ssh_private_key,
+        target_path=req.target_path,
+        chunk_size_mb=req.chunk_size_mb,
+        include_movies=req.include_movies,
+        include_clips=req.include_clips,
+        include_frames=req.include_frames,
+        include_embeddings=req.include_embeddings,
+        include_metadata=req.include_metadata,
+        migration_id=req.migration_id,
+    )
+    return {"job_id": job_id, "message": "Migration started; the source will pause active jobs."}
+
+
+@app.get("/migrations/jobs/{job_id}", dependencies=[Depends(auth)])
+def migration_job(job_id: str) -> dict[str, Any]:
+    with _CLOUD_JOBS_LOCK:
+        job = _CLOUD_JOBS.get(job_id)
+        if not job or job.get("kind") != "migration":
+            raise HTTPException(404, "Migration job not found")
+        safe = dict(job)
+        return safe
+
+
+@app.post("/migrations/prepare", dependencies=[Depends(auth)])
+def migration_prepare(req: MigrationPrepareReq) -> dict[str, Any]:
+    active_movies = running_movie_ids()
+    if active_movies:
+        raise HTTPException(409, f"Pause destination jobs before migration: {active_movies}")
+    with _CLOUD_JOBS_LOCK:
+        active_cloud = [
+            job["id"] for job in _CLOUD_JOBS.values()
+            if job.get("status") in {"queued", "running"}
+        ]
+    if active_cloud:
+        raise HTTPException(409, f"Destination has active jobs: {active_cloud}")
+    try:
+        return prepare_destination(
+            migration_id=req.migration_id,
+            manifest=req.manifest,
+            target_path=req.target_path,
+            confirmation=req.confirmation,
+        )
+    except MigrationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/migrations/{migration_id}/status", dependencies=[Depends(auth)])
+def migration_status(migration_id: str) -> dict[str, Any]:
+    try:
+        return destination_status(migration_id)
+    except MigrationError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/migrations/{migration_id}/chunk", dependencies=[Depends(auth)])
+def migration_chunk(migration_id: str, req: MigrationChunkReq) -> dict[str, Any]:
+    try:
+        return receive_chunk(
+            migration_id=migration_id,
+            name=req.name,
+            remote_path=req.remote_path,
+            sha256=req.sha256,
+            size=req.size,
+        )
+    except MigrationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/migrations/{migration_id}/finalize", dependencies=[Depends(auth)])
+def migration_finalize(migration_id: str) -> dict[str, Any]:
+    try:
+        return finalize_destination(migration_id)
+    except MigrationError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 class PurgeReq(BaseModel):
