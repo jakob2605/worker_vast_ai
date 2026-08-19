@@ -18,6 +18,7 @@ import threading
 import time
 import zipfile
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -76,8 +77,15 @@ from pipeline.video_tools import ffprobe, file_fingerprint, has_nvenc, nvenc_usa
 
 TOKEN = os.getenv("WORKER_TOKEN", "")
 STARTED_AT = time.time()
-SHUTDOWN_TIMER_PID = Path("/workspace/shutdown_timer.pid")
-SHUTDOWN_TIMER_LOG = Path("/workspace/shutdown_timer.log")
+SHUTDOWN_RUNTIME_DIR = Path("/workspace")
+try:
+    SHUTDOWN_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    if not os.access(SHUTDOWN_RUNTIME_DIR, os.W_OK):
+        raise OSError("/workspace is not writable")
+except OSError:
+    SHUTDOWN_RUNTIME_DIR = Path("/tmp")
+SHUTDOWN_TIMER_PID = SHUTDOWN_RUNTIME_DIR / "shutdown_timer.pid"
+SHUTDOWN_TIMER_LOG = SHUTDOWN_RUNTIME_DIR / "shutdown_timer.log"
 
 app = FastAPI(title="Movie clips GPU worker")
 _CLOUD_JOBS: dict[str, dict[str, Any]] = {}
@@ -90,6 +98,12 @@ _EMBEDDING_CACHE: dict[str, Any] = {
     "index": None,
 }
 _EMBEDDING_CACHE_LOCK = threading.Lock()
+_PIPELINE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="media-pipeline",
+)
+_PIPELINE_QUEUE_LOCK = threading.Lock()
+_QUEUED_MOVIES: set[int] = set()
 
 
 VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
@@ -100,6 +114,31 @@ def auth(x_worker_token: str = Header(default="")) -> None:
         return  # unset means local testing
     if x_worker_token != TOKEN:
         raise HTTPException(401, "Bad or missing X-Worker-Token")
+
+
+def _run_movie_to_completion(movie_id: int) -> None:
+    """Run one movie and keep the serial queue occupied until it finishes."""
+    start_processing(movie_id)
+    while is_processing(movie_id):
+        time.sleep(1.0)
+
+
+def queue_movie_processing(movie_id: int) -> bool:
+    # One queue slot is intentional: the GPU, decoder, encoder, and disk are
+    # shared by all jobs, so parallel media pipelines reduce total throughput.
+    with _PIPELINE_QUEUE_LOCK:
+        if movie_id in _QUEUED_MOVIES or is_processing(movie_id):
+            return False
+        _QUEUED_MOVIES.add(movie_id)
+        db.update_movie(movie_id, paused=0, status="queued", progress_stage="queued", error=None)
+        future = _PIPELINE_EXECUTOR.submit(_run_movie_to_completion, movie_id)
+
+    def release(_future: Any) -> None:
+        with _PIPELINE_QUEUE_LOCK:
+            _QUEUED_MOVIES.discard(movie_id)
+
+    future.add_done_callback(release)
+    return True
 
 
 def clean_filename(name: str, fallback: str = "upload.mp4") -> str:
@@ -790,11 +829,12 @@ def shutdown_later(req: ShutdownReq) -> dict[str, Any]:
         try:
             old_pid = int(SHUTDOWN_TIMER_PID.read_text(encoding="utf-8").strip())
             os.kill(old_pid, 0)
+        except (ProcessLookupError, ValueError):
+            SHUTDOWN_TIMER_PID.unlink(missing_ok=True)
+        except OSError as exc:
+            raise HTTPException(500, f"Could not inspect existing shutdown timer: {exc}") from exc
+        else:
             raise HTTPException(409, f"Shutdown timer already scheduled as PID {old_pid}")
-        except ProcessLookupError:
-            SHUTDOWN_TIMER_PID.unlink(missing_ok=True)
-        except ValueError:
-            SHUTDOWN_TIMER_PID.unlink(missing_ok=True)
 
     seconds = minutes * 60
     due_at = time.time() + seconds
@@ -827,14 +867,26 @@ kill -TERM 1 >> "{SHUTDOWN_TIMER_LOG}" 2>&1 || true
 sleep 15
 kill -KILL 1 >> "{SHUTDOWN_TIMER_LOG}" 2>&1 || true
 """
-    proc = subprocess.Popen(
-        ["bash", "-lc", script],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    SHUTDOWN_TIMER_PID.write_text(str(proc.pid), encoding="utf-8")
+    shell = shutil.which("bash")
+    command = [shell, "-lc", script] if shell else ["sh", "-c", script]
+    proc: subprocess.Popen[Any] | None = None
+    try:
+        SHUTDOWN_TIMER_LOG.parent.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        SHUTDOWN_TIMER_PID.write_text(str(proc.pid), encoding="utf-8")
+    except OSError as exc:
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
+                pass
+        raise HTTPException(500, f"Could not start the shutdown timer: {exc}") from exc
     return {
         "scheduled": True,
         "minutes": minutes,
@@ -954,7 +1006,7 @@ def create_jobs(req: IngestReq) -> dict[str, Any]:
             holder["reprocessed_existing"] = True
             holder.update(cleanup)
             if req.autostart:
-                start_processing(int(existing["id"]))
+                queue_movie_processing(int(existing["id"]))
             accepted.append(holder)
             continue
 
@@ -969,11 +1021,14 @@ def create_jobs(req: IngestReq) -> dict[str, Any]:
                 )
                 h["movie_id"] = movie_id
                 if req.autostart:
-                    start_processing(movie_id)
+                    _run_movie_to_completion(movie_id)
             except Exception as exc:  # noqa: BLE001
                 h["error"] = str(exc)
 
-        threading.Thread(target=run, daemon=True).start()
+        # Queue the complete download + processing pipeline instead of starting
+        # one media thread per URL. This keeps the worker responsive and makes
+        # large batches run strictly one job at a time.
+        _PIPELINE_EXECUTOR.submit(run)
         accepted.append(holder)
     return {"accepted": len(accepted), "jobs": accepted}
 
@@ -1081,7 +1136,7 @@ async def upload_jobs(
                     max_blind_clip_seconds=max_blind_clip_seconds,
                 )
                 if autostart:
-                    start_processing(int(existing["id"]))
+                    queue_movie_processing(int(existing["id"]))
                 accepted.append({
                     **item,
                     **cleanup,
@@ -1112,7 +1167,7 @@ async def upload_jobs(
             )
             record_source_link(movie_id, original_name, collection_title, source_url, target, source_type="upload")
             if autostart:
-                start_processing(movie_id)
+                queue_movie_processing(movie_id)
             accepted.append({"movie_id": movie_id, "original_name": original_name})
         except Exception as exc:  # noqa: BLE001
             target.unlink(missing_ok=True)
@@ -1128,12 +1183,13 @@ def start_job(movie_id: int) -> dict[str, Any]:
     movie = db.get_movie(movie_id)
     if not movie:
         raise HTTPException(404, "Movie not found")
-    if is_processing(movie_id):
-        return {"started": False, "movie": movie, "message": "Movie is already running."}
+    if is_processing(movie_id) or movie.get("progress_stage") == "queued":
+        return {"started": False, "queued": movie.get("progress_stage") == "queued", "movie": movie, "message": "Movie is already running or queued."}
     cleanup: dict[str, int] | None = None
     if not movie.get("paused") and db.count_clips({"movie_id": movie_id}) > 0:
         cleanup = reset_processing_outputs(movie_id)
-    return {"started": start_processing(movie_id), "movie": db.get_movie(movie_id), "cleanup": cleanup}
+    started = queue_movie_processing(movie_id)
+    return {"started": started, "queued": True, "movie": db.get_movie(movie_id), "cleanup": cleanup}
 
 
 @app.post("/jobs/{movie_id}/pause", dependencies=[Depends(auth)])

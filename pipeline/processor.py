@@ -9,6 +9,7 @@ import threading
 import time
 from collections import deque
 from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -42,11 +43,21 @@ from .video_tools import ToolMissingError, download_movie, export_clip, ffprobe
 
 _job_lock = threading.Lock()
 _running_jobs: dict[int, threading.Thread] = {}
+_pipeline_execution_lock = threading.Lock()
 _download_link_lock = threading.Lock()
 _semantic_lock = threading.RLock()
 _semantic_queue_condition = threading.Condition()
 _semantic_queue: deque[str] = deque()
 _active_semantic_ticket = ""
+
+
+def _serialize_pipeline(operation: Callable[..., Any]) -> Callable[..., Any]:
+    """Allow only one full media-processing pipeline to use the box at a time."""
+    @wraps(operation)
+    def serialized(*args: Any, **kwargs: Any) -> Any:
+        with _pipeline_execution_lock:
+            return operation(*args, **kwargs)
+    return serialized
 
 
 @contextmanager
@@ -459,6 +470,7 @@ def reset_semantic_outputs(movie_id: int) -> dict[str, int]:
     return {"files_removed": removed, "clips_reset": sum(1 for clip in clips if clip["status"] != "too_short")}
 
 
+@_serialize_pipeline
 def process_movie(movie_id: int) -> None:
     movie = db.get_movie(movie_id)
     if not movie:
@@ -541,6 +553,7 @@ def process_movie(movie_id: int) -> None:
             _running_jobs.pop(movie_id, None)
 
 
+@_serialize_pipeline
 def process_semantics_only(
     movie_id: int,
     profile_id: str = DEFAULT_PROFILE_ID,
