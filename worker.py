@@ -62,6 +62,7 @@ from pipeline.processor import (  # noqa: E402
     embed_texts_for_profile,
     ingest_url,
     is_processing,
+    normalize_blind_clip_seconds,
     pause_processing,
     record_source_link,
     reset_processing_outputs,
@@ -894,6 +895,8 @@ class IngestReq(BaseModel):
     movie_name: str
     autostart: bool = True
     allow_reprocess: bool = False
+    skip_clip_detection: bool = False
+    max_blind_clip_seconds: float = 20.0
 
 
 class TitleReq(BaseModel):
@@ -921,6 +924,10 @@ def create_jobs(req: IngestReq) -> dict[str, Any]:
         raise HTTPException(400, "movie_name is required")
     if not urls:
         raise HTTPException(400, "At least one movie URL is required")
+    try:
+        max_blind_clip_seconds = normalize_blind_clip_seconds(req.max_blind_clip_seconds)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     for index, url in enumerate(urls, start=1):
         original_name = movie_name if len(urls) == 1 else f"{movie_name} {index}"
         holder: dict[str, Any] = {"url": url, "original_name": original_name}
@@ -937,6 +944,12 @@ def create_jobs(req: IngestReq) -> dict[str, Any]:
                 accepted.append(holder)
                 continue
             cleanup = reset_processing_outputs(int(existing["id"]))
+            db.update_movie(
+                int(existing["id"]),
+                skip_clip_detection=req.skip_clip_detection,
+                max_blind_clip_seconds=max_blind_clip_seconds,
+                collection_title=movie_name,
+            )
             holder["movie_id"] = existing["id"]
             holder["reprocessed_existing"] = True
             holder.update(cleanup)
@@ -947,7 +960,13 @@ def create_jobs(req: IngestReq) -> dict[str, Any]:
 
         def run(u: str = url, name: str = original_name, h: dict[str, Any] = holder) -> None:
             try:
-                movie_id = ingest_url(u, original_name=name, collection_title=movie_name)
+                movie_id = ingest_url(
+                    u,
+                    original_name=name,
+                    collection_title=movie_name,
+                    skip_clip_detection=req.skip_clip_detection,
+                    max_blind_clip_seconds=max_blind_clip_seconds,
+                )
                 h["movie_id"] = movie_id
                 if req.autostart:
                     start_processing(movie_id)
@@ -1007,6 +1026,8 @@ async def upload_jobs(
     title: str = Form(...),
     autostart: bool = Form(True),
     allow_reprocess: bool = Form(False),
+    skip_clip_detection: bool = Form(False),
+    max_blind_clip_seconds: float = Form(20.0),
     files: list[UploadFile] = File(...),
 ) -> dict[str, Any]:
     collection_title = title.strip()
@@ -1014,6 +1035,10 @@ async def upload_jobs(
         raise HTTPException(400, "title is required")
     if not files:
         raise HTTPException(400, "At least one file is required")
+    try:
+        max_blind_clip_seconds = normalize_blind_clip_seconds(max_blind_clip_seconds)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
     accepted: list[dict[str, Any]] = []
     for file in files:
@@ -1049,7 +1074,12 @@ async def upload_jobs(
                     accepted.append(item)
                     continue
                 cleanup = reset_processing_outputs(int(existing["id"]))
-                db.update_movie(int(existing["id"]), collection_title=collection_title)
+                db.update_movie(
+                    int(existing["id"]),
+                    collection_title=collection_title,
+                    skip_clip_detection=skip_clip_detection,
+                    max_blind_clip_seconds=max_blind_clip_seconds,
+                )
                 if autostart:
                     start_processing(int(existing["id"]))
                 accepted.append({
@@ -1069,6 +1099,8 @@ async def upload_jobs(
                 width=int(info["width"]),
                 height=int(info["height"]),
                 collection_title=collection_title,
+                skip_clip_detection=skip_clip_detection,
+                max_blind_clip_seconds=max_blind_clip_seconds,
             )
             source_url = f"local-upload:{original_name}"
             db.update_movie(

@@ -54,6 +54,8 @@ def init_db() -> None:
                 collection_title TEXT DEFAULT '',
                 encoder TEXT DEFAULT '',
                 device TEXT DEFAULT '',
+                skip_clip_detection INTEGER NOT NULL DEFAULT 0,
+                max_blind_clip_seconds REAL NOT NULL DEFAULT 20.0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -139,6 +141,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "collection_title": "TEXT DEFAULT ''",
             "encoder": "TEXT DEFAULT ''",
             "device": "TEXT DEFAULT ''",
+            "skip_clip_detection": "INTEGER NOT NULL DEFAULT 0",
+            "max_blind_clip_seconds": "REAL NOT NULL DEFAULT 20.0",
             "active_embedding_profile": "TEXT DEFAULT ''",
             "embeddings_per_clip": "INTEGER DEFAULT 0",
         },
@@ -213,16 +217,22 @@ def create_movie(
     width: int,
     height: int,
     collection_title: str = "",
+    skip_clip_detection: bool = False,
+    max_blind_clip_seconds: float = 20.0,
 ) -> int:
     now = utc_now()
     with connect() as conn:
         cur = conn.execute(
             """
             INSERT INTO movies
-                (original_name, filename, path, checksum, duration, fps, width, height, collection_title, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (original_name, filename, path, checksum, duration, fps, width, height,
+                 collection_title, skip_clip_detection, max_blind_clip_seconds, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (original_name, filename, str(path), checksum, duration, fps, width, height, collection_title, now, now),
+            (
+                original_name, filename, str(path), checksum, duration, fps, width, height,
+                collection_title, int(bool(skip_clip_detection)), float(max_blind_clip_seconds), now, now,
+            ),
         )
         return int(cur.lastrowid)
 

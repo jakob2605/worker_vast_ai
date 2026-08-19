@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import re
 import shutil
 import threading
@@ -101,12 +103,30 @@ def _timed_call(movie_id: int, stage: str, operation: Callable[..., Any], *args:
     return result
 
 
-def ingest_url(url: str, original_name: str | None = None, collection_title: str = "") -> int:
+def normalize_blind_clip_seconds(value: float | int | str) -> float:
+    """Validate the maximum duration for a pre-cut, blind clip import."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_blind_clip_seconds must be a number") from exc
+    if not math.isfinite(seconds) or seconds < 0.1 or seconds > 3600:
+        raise ValueError("max_blind_clip_seconds must be at least 0.1 and no more than 3600")
+    return seconds
+
+
+def ingest_url(
+    url: str,
+    original_name: str | None = None,
+    collection_title: str = "",
+    skip_clip_detection: bool = False,
+    max_blind_clip_seconds: float = 20.0,
+) -> int:
     """
     Download a movie onto this box and register it, replacing the browser-upload
     path from the local app. Returns the new movie id.
     """
     ensure_library_dirs()
+    max_blind_clip_seconds = normalize_blind_clip_seconds(max_blind_clip_seconds)
     parsed_name = original_name or unquote(Path(urlparse(url).path).name) or "movie.mp4"
     suffix = Path(parsed_name).suffix.lower() or ".mp4"
     filename = f"{uuid.uuid4().hex}{suffix}"
@@ -122,6 +142,8 @@ def ingest_url(url: str, original_name: str | None = None, collection_title: str
         width=0,
         height=0,
         collection_title=collection_title,
+        skip_clip_detection=skip_clip_detection,
+        max_blind_clip_seconds=max_blind_clip_seconds,
     )
     record_source_link(movie_id, parsed_name, collection_title, url, target, source_type="url")
     db.update_movie(
@@ -447,28 +469,43 @@ def process_movie(movie_id: int) -> None:
     timing_event("pipeline_start", movie_id=movie_id, mode="full")
     try:
         source = Path(movie["path"])
-        db.update_movie(movie_id, status="processing", progress_stage="detecting_shots", progress_detail="Detecting shot boundaries")
-        shots, detector = _timed_call(
-            movie_id,
-            "shot_detection",
-            detect_shots,
-            source,
-            float(movie["fps"] or 25.0),
-            float(movie["duration"] or 0.0),
-            SETTINGS.transnet_threshold,
-            SETTINGS.merge_tiny_shots_seconds,
-        )
-        db.update_movie(movie_id, detector=detector)
-        _timed_call(movie_id, "shot_store", _store_shots, movie_id, shots)
+        duration = float(movie["duration"] or 0.0)
+        blind_limit = normalize_blind_clip_seconds(movie.get("max_blind_clip_seconds", 20.0))
+        use_blind_import = bool(movie.get("skip_clip_detection")) and duration <= blind_limit
+
+        if use_blind_import:
+            db.update_movie(
+                movie_id,
+                status="processing",
+                progress_stage="clip_import",
+                progress_detail=f"Importing pre-cut clip (shot detection skipped; <= {blind_limit:.1f}s)",
+                detector="precut_import",
+            )
+            _timed_call(movie_id, "clip_import", _import_blind_clip, movie_id, source, duration, float(movie["fps"] or 25.0))
+        else:
+            db.update_movie(movie_id, status="processing", progress_stage="detecting_shots", progress_detail="Detecting shot boundaries")
+            shots, detector = _timed_call(
+                movie_id,
+                "shot_detection",
+                detect_shots,
+                source,
+                float(movie["fps"] or 25.0),
+                duration,
+                SETTINGS.transnet_threshold,
+                SETTINGS.merge_tiny_shots_seconds,
+            )
+            db.update_movie(movie_id, detector=detector)
+            _timed_call(movie_id, "shot_store", _store_shots, movie_id, shots)
         if _is_paused(movie_id):
             outcome = "paused"
             return
 
-        db.update_movie(movie_id, progress_stage="exporting_clips", progress_detail="Exporting MP4 clips")
-        _timed_call(movie_id, "clip_export", _export_missing_clips, movie_id, source)
-        if _is_paused(movie_id):
-            outcome = "paused"
-            return
+        if not use_blind_import:
+            db.update_movie(movie_id, progress_stage="exporting_clips", progress_detail="Exporting MP4 clips")
+            _timed_call(movie_id, "clip_export", _export_missing_clips, movie_id, source)
+            if _is_paused(movie_id):
+                outcome = "paused"
+                return
 
         db.update_movie(movie_id, progress_stage="motion_analysis", progress_detail="Analyzing camera and animation movement")
         _timed_call(movie_id, "motion_analysis", _analyze_missing_motion, movie_id, source)
@@ -594,6 +631,41 @@ def _store_shots(movie_id: int, shots: list[Shot]) -> None:
             duration=shot.duration,
             status=status,
         )
+
+
+def _import_blind_clip(movie_id: int, source: Path, duration: float, fps: float) -> None:
+    """Register one already-cut source file without decoding or re-encoding it."""
+    if not source.exists():
+        raise FileNotFoundError(source)
+    movie = db.get_movie(movie_id)
+    folder_name = _movie_folder_name(movie_id, movie["original_name"] if movie else source.stem)
+    movie_dir = CLIPS_DIR / folder_name
+    movie_dir.mkdir(parents=True, exist_ok=True)
+    end_frame = max(1, int(round(duration * (fps or 25.0))) - 1)
+    suffix = source.suffix.lower() or ".mp4"
+    target = movie_dir / f"clip_00001_0.00-{duration:.2f}{suffix}"
+    method = "existing"
+    if not target.exists():
+        try:
+            # Same-filesystem hardlink: no second copy of the media is stored.
+            os.link(source, target)
+            method = "hardlink"
+        except OSError:
+            # A copy is the safe fallback when movies and clips are on different filesystems.
+            shutil.copy2(source, target)
+            method = "copy"
+    db.upsert_clip(
+        movie_id,
+        1,
+        start_frame=0,
+        end_frame=end_frame,
+        start_time=0.0,
+        end_time=duration,
+        duration=duration,
+        status="exported",
+        clip_path=str(target),
+    )
+    db.update_movie(movie_id, encoder=f"precut-import ({method})", device="cpu")
 
 
 def _export_missing_clips(movie_id: int, source: Path) -> None:
