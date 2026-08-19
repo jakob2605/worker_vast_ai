@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import traceback
 
 import cv2
 import numpy as np
@@ -25,9 +26,24 @@ def detect_shots(video_path: Path, fps: float, duration: float, threshold: float
             shots, name = detector(video_path, fps, duration, threshold)
             if shots:
                 return _merge_tiny_shots(shots, merge_tiny_seconds), name
+            print(
+                f"SHOT_DETECTOR_EMPTY detector={detector.__name__} "
+                f"path={video_path} duration={duration:.3f}",
+                flush=True,
+            )
         except Exception:
+            print(
+                f"SHOT_DETECTOR_ERROR detector={detector.__name__} "
+                f"path={video_path} duration={duration:.3f}",
+                flush=True,
+            )
+            traceback.print_exc()
             continue
     fallback = [Shot(0, int(duration * fps), 0.0, duration)]
+    print(
+        f"SHOT_DETECTOR_FALLBACK path={video_path} duration={duration:.3f}",
+        flush=True,
+    )
     return fallback, "single-shot-fallback"
 
 
@@ -129,4 +145,3 @@ def _merge_tiny_shots(shots: list[Shot], min_seconds: float) -> list[Shot]:
         current = Shot(prev.start_frame, current.end_frame, prev.start_time, current.end_time)
     merged.append(current)
     return merged
-
