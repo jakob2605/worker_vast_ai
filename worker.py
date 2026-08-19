@@ -809,6 +809,7 @@ def restart() -> dict[str, Any]:
 
 class ShutdownReq(BaseModel):
     minutes: int
+    instance_id: int | None = None
 
 
 @app.post("/shutdown-later", dependencies=[Depends(auth)])
@@ -838,21 +839,34 @@ def shutdown_later(req: ShutdownReq) -> dict[str, Any]:
         else:
             raise HTTPException(409, f"Shutdown timer already scheduled as PID {old_pid}")
 
+    # Stop movie-processing jobs cooperatively before the countdown starts.
+    # The processor checks this flag between work units and records the job as
+    # paused, so the instance is not terminated in the middle of a checkpoint.
+    active_movies = running_movie_ids()
+    for movie_id in active_movies:
+        pause_processing(movie_id)
+
     seconds = minutes * 60
+    grace_seconds = 120
     due_at = time.time() + seconds
     due_iso = datetime.fromtimestamp(due_at, timezone.utc).isoformat(timespec="seconds")
-    has_vast_api = bool(os.getenv("CONTAINER_API_KEY") and os.getenv("CONTAINER_ID"))
+    api_key = os.getenv("CONTAINER_API_KEY") or os.getenv("VAST_API_KEY")
+    instance_id = str(req.instance_id or os.getenv("CONTAINER_ID") or os.getenv("VAST_INSTANCE_ID") or "")
+    has_vast_api = bool(api_key and instance_id)
     script = f"""
 set -eu
 echo "scheduled stop for {due_iso} after {minutes} minute(s)" >> "{SHUTDOWN_TIMER_LOG}"
 sleep {seconds}
 echo "stopping Vast instance at $(date -u)" >> "{SHUTDOWN_TIMER_LOG}"
+echo "jobs were paused before scheduling; allowing {grace_seconds}s grace period" >> "{SHUTDOWN_TIMER_LOG}"
+sleep {grace_seconds}
 sync || true
-instance_id="${{CONTAINER_ID:-${{VAST_INSTANCE_ID:-}}}}"
-if [ -n "${{CONTAINER_API_KEY:-}}" ] && [ -n "$instance_id" ] && echo "$instance_id" | grep -Eq '^[0-9]+$'; then
+instance_id="{instance_id}"
+api_key="{api_key or ''}"
+if [ -n "$api_key" ] && [ -n "$instance_id" ] && echo "$instance_id" | grep -Eq '^[0-9]+$'; then
   if curl -fsS --retry 8 --retry-delay 2 --max-time 30 \\
       -X PUT \\
-      -H "Authorization: Bearer $CONTAINER_API_KEY" \\
+      -H "Authorization: Bearer $api_key" \\
       -H "Content-Type: application/json" \\
       -d '{{"state":"stopped"}}' \\
       "https://console.vast.ai/api/v0/instances/$instance_id/" >> "{SHUTDOWN_TIMER_LOG}" 2>&1; then
@@ -893,6 +907,8 @@ kill -KILL 1 >> "{SHUTDOWN_TIMER_LOG}" 2>&1 || true
         "scheduled": True,
         "minutes": minutes,
         "seconds": seconds,
+        "grace_seconds": grace_seconds,
+        "paused_movie_jobs": active_movies,
         "due_at": due_at,
         "due_at_utc": due_iso,
         "pid": proc.pid,
