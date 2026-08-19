@@ -22,10 +22,21 @@ class Shot:
 
 def detect_shots(video_path: Path, fps: float, duration: float, threshold: float, merge_tiny_seconds: float) -> tuple[list[Shot], str]:
     for detector in (_transnet_detector, _pyscenedetect_detector, _opencv_histogram_detector):
+        print(
+            f"SHOT_DETECTOR_START detector={detector.__name__} "
+            f"path={video_path} duration={duration:.3f}",
+            flush=True,
+        )
         try:
             shots, name = detector(video_path, fps, duration, threshold)
             if shots:
-                return _merge_tiny_shots(shots, merge_tiny_seconds), name
+                merged = _merge_tiny_shots(shots, merge_tiny_seconds)
+                print(
+                    f"SHOT_DETECTOR_SUCCESS detector={detector.__name__} "
+                    f"name={name} shots={len(merged)} path={video_path}",
+                    flush=True,
+                )
+                return merged, name
             print(
                 f"SHOT_DETECTOR_EMPTY detector={detector.__name__} "
                 f"path={video_path} duration={duration:.3f}",
