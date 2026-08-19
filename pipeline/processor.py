@@ -35,7 +35,7 @@ from .profiles import (
 from .semantics import SemanticAnalyzer
 from .shot_detection import Shot, detect_shots
 from .timing import timing_event
-from .video_tools import ToolMissingError, download_movie, export_clip, ffprobe, file_sha256
+from .video_tools import ToolMissingError, download_movie, export_clip, ffprobe
 
 
 _job_lock = threading.Lock()
@@ -143,12 +143,21 @@ def ingest_url(url: str, original_name: str | None = None, collection_title: str
         download_started = time.perf_counter()
         download_movie(url, target, progress=on_progress)
         download_s = time.perf_counter() - download_started
+        db.update_movie(movie_id, progress_detail="Inspecting video metadata")
         probe_started = time.perf_counter()
         info = ffprobe(target)
         probe_s = time.perf_counter() - probe_started
-        checksum_started = time.perf_counter()
-        checksum = file_sha256(target)
-        checksum_s = time.perf_counter() - checksum_started
+        # URL imports are already de-duplicated by source URL before download.
+        # Avoid reading a large movie a second time just to calculate SHA-256;
+        # retain a lightweight, explicit fingerprint for metadata/embedding
+        # provenance. Local browser uploads still use a cryptographic checksum
+        # in worker.py because they need content-based duplicate detection.
+        file_size = target.stat().st_size
+        checksum = (
+            f"size:{file_size}:duration:{float(info['duration']):.3f}:"
+            f"fps:{float(info['fps']):.3f}:width:{int(info['width'])}:height:{int(info['height'])}"
+        )
+        checksum_s = 0.0
         db.update_movie(
             movie_id,
             checksum=checksum,
@@ -169,6 +178,7 @@ def ingest_url(url: str, original_name: str | None = None, collection_title: str
             download_s=round(download_s, 4),
             probe_s=round(probe_s, 4),
             checksum_s=round(checksum_s, 4),
+            checksum_method="size+metadata",
             elapsed_s=round(time.perf_counter() - ingest_started, 4),
         )
     except Exception as exc:  # noqa: BLE001
