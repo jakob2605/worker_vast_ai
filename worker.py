@@ -544,9 +544,11 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
         return []
     mark("candidates_done", candidates=len(candidate_rows))
     candidate_indexes_array = np.asarray(candidate_indexes, dtype="int64")
-    means = embedding_index["means"][candidate_indexes_array]
+    # Keep the candidate embedding matrix separate from the per-query score
+    # statistics below.  The anchor pass needs the original vectors.
+    candidate_means = embedding_index["means"][candidate_indexes_array]
     stage = time.perf_counter()
-    scores = np.asarray(vectors[:len(queries)], dtype="float32") @ means.T
+    scores = np.asarray(vectors[:len(queries)], dtype="float32") @ candidate_means.T
     mark("mean_scores_done", stage, shape=scores.shape)
     best_times = np.zeros((len(queries), len(candidate_rows)), dtype="float32")
     frame_weight = 0.0 if req.embedding_mode == "mean_only" else min(1.0, max(0.0, req.frame_weight))
@@ -591,7 +593,7 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
     if anchor:
         stage = time.perf_counter()
         anchor_vector = vectors[-1]
-        anchor_scores = means @ anchor_vector
+        anchor_scores = candidate_means @ anchor_vector
         if frame_weight and embedding_index["frames"].size:
             anchor_frame_scores = embedding_index["frames"] @ anchor_vector
             best_anchor_frames = np.full(len(clip_ids), -np.inf, dtype="float32")
