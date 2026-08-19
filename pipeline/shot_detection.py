@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import subprocess
 import traceback
 
 import cv2
@@ -60,13 +61,52 @@ def detect_shots(video_path: Path, fps: float, duration: float, threshold: float
 
 def _transnet_detector(video_path: Path, fps: float, duration: float, threshold: float) -> tuple[list[Shot], str]:
     from transnetv2_pytorch import TransNetV2
+    import torch
 
     from .config import SETTINGS
 
-    # Was hardcoded to cpu. This is the first of the three GPU wins.
     model = TransNetV2(device=SETTINGS.device)
     model.eval()
-    scenes = model.detect_scenes(str(video_path), threshold=threshold)
+    decode_with_cuda = SETTINGS.device == "cuda"
+
+    def extract_frames(use_hwaccel: bool) -> bytes:
+        command = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+        if use_hwaccel:
+            # Decode on NVIDIA hardware, then download the tiny 48x27 RGB
+            # frames to system memory for the Python model input.
+            command += ["-hwaccel", "cuda"]
+        command += [
+            "-i", str(video_path),
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "48x27", "pipe:1",
+        ]
+        result = subprocess.run(command, capture_output=True, check=False)
+        if result.returncode:
+            detail = result.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"FFmpeg frame extraction failed: {detail[-800:]}")
+        return result.stdout
+
+    try:
+        video_stream = extract_frames(decode_with_cuda)
+    except Exception as exc:
+        if not decode_with_cuda:
+            raise
+        print(
+            f"TRANSNET_NVDEC_FALLBACK path={video_path} error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        decode_with_cuda = False
+        video_stream = extract_frames(False)
+
+    video = np.frombuffer(video_stream, np.uint8).reshape([-1, 27, 48, 3])
+    video_tensor = torch.from_numpy(np.array(video, copy=True)).to(SETTINGS.device)
+    single_frame_predictions, _all_frame_predictions = model.predict_frames(
+        video_tensor, quiet=True,
+    )
+    scenes = model.predictions_to_scenes_with_data(
+        single_frame_predictions.cpu().detach().numpy(),
+        fps=fps,
+        threshold=threshold,
+    )
     shots: list[Shot] = []
     for scene in scenes:
         start_time = float(scene.get("start_time", 0.0))
@@ -75,7 +115,8 @@ def _transnet_detector(video_path: Path, fps: float, duration: float, threshold:
         end_frame = int(scene.get("end_frame", round(end_time * fps)))
         if end_time > start_time:
             shots.append(Shot(start_frame, end_frame, start_time, end_time))
-    return shots, f"transnetv2-pytorch-{SETTINGS.device}"
+    decoder = "nvdec" if decode_with_cuda else "software"
+    return shots, f"transnetv2-pytorch-{SETTINGS.device}-{decoder}"
 
 
 def _pyscenedetect_detector(video_path: Path, fps: float, duration: float, threshold: float) -> tuple[list[Shot], str]:
