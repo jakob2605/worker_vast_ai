@@ -35,6 +35,36 @@ def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def file_fingerprint(
+    path: Path,
+    metadata: dict[str, float | int] | None = None,
+    sample_size: int = 1024 * 1024,
+) -> str:
+    """Create a fast duplicate fingerprint without reading the whole movie.
+
+    The file size, ffprobe metadata, and up to 1 MiB from the beginning, middle,
+    and end are hashed. This is not a cryptographic replacement for SHA-256 of
+    the complete file, but is substantially faster for large video uploads and
+    much safer than comparing file size alone.
+    """
+    size = path.stat().st_size
+    digest = hashlib.sha256()
+    digest.update(f"size:{size};metadata:".encode("utf-8"))
+    digest.update(json.dumps(metadata or {}, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    digest.update(b";samples:")
+
+    offsets = sorted({
+        0,
+        max(0, size // 2 - sample_size // 2),
+        max(0, size - sample_size),
+    })
+    with path.open("rb") as handle:
+        for offset in offsets:
+            handle.seek(offset)
+            digest.update(handle.read(sample_size))
+    return f"sampled-sha256:{digest.hexdigest()}"
+
+
 def ffprobe(path: Path) -> dict[str, float | int]:
     require_command("ffprobe")
     cmd = [

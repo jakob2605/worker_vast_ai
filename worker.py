@@ -71,7 +71,7 @@ from pipeline.processor import (  # noqa: E402
 )
 from pipeline.profiles import BUILTIN_PROFILES, DEFAULT_PROFILE_ID, get_profile  # noqa: E402
 from pipeline.semantics import SemanticAnalyzer  # noqa: E402
-from pipeline.video_tools import ffprobe, file_sha256, has_nvenc, nvenc_usable  # noqa: E402
+from pipeline.video_tools import ffprobe, file_fingerprint, has_nvenc, nvenc_usable  # noqa: E402
 
 TOKEN = os.getenv("WORKER_TOKEN", "")
 STARTED_AT = time.time()
@@ -1031,7 +1031,7 @@ async def upload_jobs(
                 while chunk := await file.read(1024 * 1024):
                     handle.write(chunk)
             info = ffprobe(target)
-            checksum = file_sha256(target)
+            checksum = file_fingerprint(target, info)
             existing = db.find_movie_by_checksum(checksum)
             if existing:
                 target.unlink(missing_ok=True)
