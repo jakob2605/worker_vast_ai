@@ -76,6 +76,7 @@ class LanguageBindAnalyzer:
         end_time: float,
         *,
         movie_id: int | None = None,
+        existing_frame_paths: list[str] | None = None,
     ) -> dict[str, Any]:
         del movie_id
         duration = max(0.01, end_time - start_time)
@@ -104,6 +105,12 @@ class LanguageBindAnalyzer:
                 cv2.imwrite(str(path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
                 paths.append(path)
                 saved_paths.append(str(path))
+            # Reuse frames produced earlier in the pipeline if the source
+            # cannot be reopened/seeked by OpenCV (common with mounted files).
+            if not paths and existing_frame_paths:
+                start = round(window_index * len(existing_frame_paths) / self.embeddings_per_clip)
+                stop = round((window_index + 1) * len(existing_frame_paths) / self.embeddings_per_clip)
+                paths = [Path(path) for path in existing_frame_paths[start:stop]]
             if not paths:
                 continue
             result = self._request({"op": "images", "paths": [str(path) for path in paths]})

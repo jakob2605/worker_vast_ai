@@ -832,13 +832,23 @@ def _analyze_embedding_profile(
                 try:
                     saved_frames = _saved_frame_paths(clip_id)
                     analyze_kwargs = {"movie_id": movie_id}
-                    if profile.model_type == "siglip2":
+                    if profile.model_type in {"siglip2", "languagebind"}:
                         analyze_kwargs["existing_frame_paths"] = saved_frames
+                    analyze_source = source
+                    analyze_start = float(clip["start_time"])
+                    analyze_end = float(clip["end_time"])
+                    clip_duration = analyze_end - analyze_start
+                    if profile.model_type == "languagebind":
+                        clip_source = Path(clip.get("clip_path") or "")
+                        if clip_source.exists():
+                            analyze_source = clip_source
+                            analyze_start = 0.0
+                            analyze_end = float(clip.get("duration") or clip_duration)
                     result = analyzer.analyze_clip(
-                        source,
+                        analyze_source,
                         clip_id,
-                        float(clip["start_time"]),
-                        float(clip["end_time"]),
+                        analyze_start,
+                        analyze_end,
                         **analyze_kwargs,
                     )
                     timings = result.pop("_timings", {})
