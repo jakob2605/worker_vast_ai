@@ -775,6 +775,26 @@ def update() -> dict[str, Any]:
         capture_output=True, text=True,
     ).stdout.strip()
 
+    # Git updates do not run bootstrap.sh again. Install the worker-owned
+    # Whisper dependencies here so a code pull also deploys its runtime deps.
+    requirements = worker_dir / "requirements.txt"
+    whisper_requirements = []
+    if requirements.exists():
+        for raw_line in requirements.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if line and not line.startswith("#") and line.startswith(("faster-whisper", "yt-dlp")):
+                whisper_requirements.append(line)
+    if whisper_requirements:
+        install = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--no-cache-dir", *whisper_requirements],
+            capture_output=True, text=True, timeout=900,
+        )
+        result["whisper_install_ok"] = install.returncode == 0
+        result["whisper_install_stdout"] = install.stdout[-2000:].strip()
+        result["whisper_install_stderr"] = install.stderr[-2000:].strip()
+        if install.returncode != 0:
+            raise HTTPException(502, "Whisper dependency installation failed")
+
     port = os.getenv("WORKER_PORT", "8100")
 
     def restart() -> None:
