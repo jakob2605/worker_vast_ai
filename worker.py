@@ -73,7 +73,13 @@ from pipeline.processor import (  # noqa: E402
 )
 from pipeline.profiles import BUILTIN_PROFILES, DEFAULT_PROFILE_ID, get_profile  # noqa: E402
 from pipeline.semantics import SemanticAnalyzer  # noqa: E402
-from pipeline.video_tools import ffprobe, file_fingerprint, has_nvenc, nvenc_usable  # noqa: E402
+from pipeline.video_tools import (  # noqa: E402
+    convert_gif_to_mp4,
+    ffprobe,
+    file_fingerprint,
+    has_nvenc,
+    nvenc_usable,
+)
 
 TOKEN = os.getenv("WORKER_TOKEN", "")
 STARTED_AT = time.time()
@@ -106,7 +112,7 @@ _PIPELINE_QUEUE_LOCK = threading.Lock()
 _QUEUED_MOVIES: set[int] = set()
 
 
-VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
+VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".gif"}
 
 
 def auth(x_worker_token: str = Header(default="")) -> None:
@@ -1128,11 +1134,18 @@ async def upload_jobs(
 
         filename = f"{int(time.time() * 1000)}_{len(accepted) + 1:04d}_{original_name}"
         target = MOVIES_DIR / filename
+        uploaded_target = target
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             with target.open("wb") as handle:
                 while chunk := await file.read(1024 * 1024):
                     handle.write(chunk)
+            if suffix == ".gif":
+                converted = target.with_suffix(".mp4")
+                convert_gif_to_mp4(target, converted)
+                target.unlink(missing_ok=True)
+                target = converted
+                filename = converted.name
             info = ffprobe(target)
             checksum = file_fingerprint(target, info)
             existing = db.find_movie_by_checksum(checksum)
@@ -1194,6 +1207,7 @@ async def upload_jobs(
             accepted.append({"movie_id": movie_id, "original_name": original_name})
         except Exception as exc:  # noqa: BLE001
             target.unlink(missing_ok=True)
+            uploaded_target.unlink(missing_ok=True)
             accepted.append({"original_name": original_name, "error": str(exc)})
         finally:
             await file.close()

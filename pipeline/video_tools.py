@@ -105,6 +105,24 @@ def ffprobe(path: Path) -> dict[str, float | int]:
     }
 
 
+def convert_gif_to_mp4(source: Path, target: Path) -> Path:
+    """Convert one uploaded GIF to a seekable MP4 movie."""
+    require_command("ffmpeg")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        # Ignore an infinite GIF loop and import the animation once.
+        "-ignore_loop", "1", "-i", str(source),
+        "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart", str(target),
+    ]
+    subprocess.check_call(command)
+    if not target.is_file() or target.stat().st_size == 0:
+        target.unlink(missing_ok=True)
+        raise RuntimeError(f"GIF conversion produced no MP4: {source}")
+    return target
+
+
 def has_nvenc() -> bool:
     """True when this ffmpeg build exposes the NVIDIA h264 encoder."""
     try:
