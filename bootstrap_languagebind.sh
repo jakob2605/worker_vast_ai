@@ -14,7 +14,7 @@ if [ ! -x "$ENV_DIR/bin/python" ]; then
 fi
 "$ENV_DIR/bin/python" -m pip install --no-cache-dir --upgrade pip >>"$LOG" 2>&1
 "$ENV_DIR/bin/python" -m pip install --no-cache-dir \
-  'transformers==4.30.2' sentencepiece einops timm ftfy regex >>"$LOG" 2>&1
+  'transformers==4.30.2' 'tokenizers==0.13.3' 'huggingface_hub==0.16.4' 'peft==0.4.0' sentencepiece einops timm ftfy regex >>"$LOG" 2>&1
 
 if [ ! -d "$REPO_DIR/.git" ]; then
   git clone --depth 1 https://github.com/PKU-YuanGroup/LanguageBind.git "$REPO_DIR" >>"$LOG" 2>&1

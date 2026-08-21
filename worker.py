@@ -974,6 +974,11 @@ class TitleReq(BaseModel):
     update_original_name: bool = False
 
 
+class BulkJobActionReq(BaseModel):
+    title: str
+    action: str
+
+
 class SemanticsReq(BaseModel):
     profile_id: str = DEFAULT_PROFILE_ID
     embeddings_per_clip: int | None = None
@@ -1216,6 +1221,26 @@ def pause_job(movie_id: int) -> dict[str, Any]:
         raise HTTPException(404, "Movie not found")
     pause_processing(movie_id)
     return {"movie": db.get_movie(movie_id)}
+
+
+@app.post("/jobs/bulk-action", dependencies=[Depends(auth)])
+def bulk_job_action(req: BulkJobActionReq) -> dict[str, Any]:
+    if req.action not in {"start", "pause", "semantics"}:
+        raise HTTPException(400, "action must be start, pause, or semantics")
+    title = req.title.strip().casefold()
+    movies = [m for m in db.list_movies() if (m.get("collection_title") or m.get("original_name") or "").strip().casefold() == title]
+    results = []
+    for movie in movies:
+        try:
+            if req.action == "start":
+                results.append(start_job(int(movie["id"])))
+            elif req.action == "pause":
+                results.append(pause_job(int(movie["id"])))
+            else:
+                results.append(rerun_semantics_job(int(movie["id"]), SemanticsReq()))
+        except Exception as exc:  # bulk actions must continue past failed jobs
+            results.append({"movie_id": movie.get("id"), "error": f"{type(exc).__name__}: {exc}"})
+    return {"title": req.title, "action": req.action, "matched": len(movies), "results": results}
 
 
 @app.post("/jobs/{movie_id}/semantics", dependencies=[Depends(auth)])
