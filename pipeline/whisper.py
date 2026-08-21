@@ -20,7 +20,7 @@ else:
     _IMPORT_ERROR = None
 
 
-MODEL_NAME = os.getenv("WHISPER_MODEL", "medium")
+MODEL_NAME = os.getenv("WHISPER_MODEL", "large-v3")
 DEVICE = os.getenv("WHISPER_DEVICE", SETTINGS.device)
 COMPUTE_TYPE = os.getenv(
     "WHISPER_COMPUTE_TYPE",

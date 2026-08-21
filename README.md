@@ -80,7 +80,7 @@ The worker also exposes `GET /whisper` for model state and `POST /transcribe`
 with `{ "url": "https://..." }` to download and transcribe a social-media URL.
 Whisper is loaded once during worker startup and remains in GPU memory. Set
 `WHISPER_MODEL`, `WHISPER_DEVICE`, and `WHISPER_COMPUTE_TYPE` when needed;
-defaults are `medium`, the worker device, and `float16` on CUDA.
+defaults are `large-v3`, the worker device, and `float16` on CUDA.
 
 ## Verified
 
