@@ -9,6 +9,8 @@ opencv-python-headless
 # newer PyTorch and disables model loading there; v4.49+ includes SigLIP2.
 transformers>=4.49,<5
 sentencepiece
+faster-whisper>=1.1
+yt-dlp>=2025.1
 scenedetect[opencv]
 transnetv2-pytorch
 # torch is preinstalled in the vastai/pytorch image - do not reinstall it there

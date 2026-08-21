@@ -73,6 +73,11 @@ from pipeline.processor import (  # noqa: E402
 )
 from pipeline.profiles import BUILTIN_PROFILES, DEFAULT_PROFILE_ID, get_profile  # noqa: E402
 from pipeline.semantics import SemanticAnalyzer  # noqa: E402
+from pipeline.whisper import (  # noqa: E402
+    health as whisper_health,
+    transcribe_url as transcribe_media_url,
+    warm_model as warm_whisper_model,
+)
 from pipeline.video_tools import (  # noqa: E402
     convert_gif_to_mp4,
     ffprobe,
@@ -636,6 +641,8 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
 def startup() -> None:
     ensure_library_dirs()
     db.init_db()
+    # Keep Whisper resident on the GPU alongside the worker's other models.
+    warm_whisper_model()
     # A UI disconnect or worker restart must not lose an in-progress migration.
     # The request state is local and mode 0600; it is removed only after the
     # destination has validated and activated the new library.
@@ -679,6 +686,7 @@ def health() -> dict[str, Any]:
         },
         "auth_required": bool(TOKEN),
         "embedding_profiles": [profile.to_dict() for profile in BUILTIN_PROFILES],
+        "whisper": whisper_health(),
         "migration": {"supported": True, "format": MIGRATION_FORMAT},
     }
 
@@ -963,6 +971,22 @@ def gpu_detail() -> dict[str, Any]:
     analyzer = SemanticAnalyzer()
     analyzer._ensure_model()  # noqa: SLF001 - deliberate warm-up probe
     return {"semantics": analyzer.device_info(), "device": SETTINGS.device, "nvenc": has_nvenc()}
+
+
+@app.get("/whisper", dependencies=[Depends(auth)])
+def whisper_detail() -> dict[str, Any]:
+    """Report the persistent URL-transcription model state."""
+    return whisper_health()
+
+
+class TranscribeReq(BaseModel):
+    url: str
+
+
+@app.post("/transcribe", dependencies=[Depends(auth)])
+def transcribe(req: TranscribeReq) -> dict[str, Any]:
+    """Download and transcribe one social-media URL on this GPU worker."""
+    return transcribe_media_url(req.url)
 
 
 # --------------------------------------------------------------------------

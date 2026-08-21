@@ -76,6 +76,12 @@ GET  /storage                disk used by movies/clips/frames/embeddings
 POST /purge                  delete source movies, keep clips
 ```
 
+The worker also exposes `GET /whisper` for model state and `POST /transcribe`
+with `{ "url": "https://..." }` to download and transcribe a social-media URL.
+Whisper is loaded once during worker startup and remains in GPU memory. Set
+`WHISPER_MODEL`, `WHISPER_DEVICE`, and `WHISPER_COMPUTE_TYPE` when needed;
+defaults are `medium`, the worker device, and `float16` on CUDA.
+
 ## Verified
 
 Run end-to-end on CPU against a real 3-cut video: download by URL → 3 shots detected →
