@@ -61,6 +61,7 @@ from pipeline.migration import (  # noqa: E402
 from pipeline.processor import (  # noqa: E402
     embed_text_for_profile,
     embed_texts_for_profile,
+    export_clip,
     ingest_url,
     is_processing,
     normalize_blind_clip_seconds,
@@ -88,6 +89,64 @@ from pipeline.video_tools import (  # noqa: E402
 
 TOKEN = os.getenv("WORKER_TOKEN", "")
 STARTED_AT = time.time()
+_CLIP_REPAIR_LOCK = threading.Lock()
+
+
+def _playable_clip_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        info = ffprobe(path)
+        return bool(
+            float(info.get("duration") or 0) > 0.05
+            and int(info.get("width") or 0) > 0
+            and int(info.get("height") or 0) > 0
+        )
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        return False
+
+
+def _ensure_playable_clip_file(clip: dict[str, Any]) -> Path | None:
+    """Repair stale JPEG/empty clip artifacts from the source movie on demand."""
+    path = Path(clip.get("clip_path") or "")
+    if _playable_clip_file(path):
+        return path
+    movie = db.get_movie(int(clip.get("movie_id") or 0))
+    source = Path(movie.get("path") or "") if movie else Path()
+    start = float(clip.get("start_time") or 0)
+    end = float(clip.get("end_time") or 0)
+    if not source.is_file() or end <= start:
+        return None
+
+    with _CLIP_REPAIR_LOCK:
+        if _playable_clip_file(path):
+            return path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        repaired = path.with_suffix(path.suffix + ".repair.mp4")
+        repaired.unlink(missing_ok=True)
+        export_clip(
+            source,
+            repaired,
+            start,
+            end,
+            SETTINGS.export_crf,
+            SETTINGS.export_preset,
+            use_nvenc=SETTINGS.use_nvenc,
+            nvenc_preset=SETTINGS.nvenc_preset,
+            nvenc_cq=SETTINGS.nvenc_cq,
+        )
+        if not _playable_clip_file(repaired):
+            repaired.unlink(missing_ok=True)
+            return None
+        repaired.replace(path)
+        info = ffprobe(path)
+        db.update_clip(
+            int(clip["id"]),
+            clip_path=str(path),
+            duration=float(info.get("duration") or (end - start)),
+            status="exported",
+        )
+        return path
 SHUTDOWN_RUNTIME_DIR = Path("/workspace")
 try:
     SHUTDOWN_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
@@ -1428,8 +1487,8 @@ def clip_file(clip_id: int) -> FileResponse:
     clip = db.get_clip(clip_id)
     if not clip or not clip.get("clip_path"):
         raise HTTPException(404, "Clip not found")
-    path = Path(clip["clip_path"])
-    if not path.exists():
+    path = _ensure_playable_clip_file(clip)
+    if not path:
         raise HTTPException(404, "Clip file missing on disk")
     return FileResponse(path, media_type="video/mp4", filename=path.name)
 
