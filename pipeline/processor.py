@@ -752,6 +752,184 @@ def _saved_frame_paths(clip_id: int) -> list[str]:
     return [str(path) for path in candidates]
 
 
+def _persist_semantic_result(
+    movie: dict[str, Any],
+    profile: Any,
+    clip: dict[str, Any],
+    clip_embeddings: int,
+    result: dict[str, Any],
+    *,
+    update_labels: bool,
+    sampling_mode: str,
+    adaptive_seconds: float,
+    adaptive_min: int,
+    adaptive_max: int,
+    batch_frames: int = 0,
+) -> None:
+    """Persist one result after it has been produced by a single/batched pass."""
+    clip_id = int(clip["id"])
+    timings = result.pop("_timings", {})
+    if result.get("semantic_model") == "fallback-cv":
+        raise RuntimeError(result.get("description") or "Semantic model unavailable")
+    db.upsert_clip_embedding(
+        clip_id,
+        profile.id,
+        artifact_path=result["embedding_path"],
+        frame_count=int(result.get("embedding_count") or 0),
+        dimension=int(result.get("embedding_dimension") or 0),
+        status="complete",
+        source_checksum=str(movie.get("checksum") or ""),
+    )
+    db_started = time.perf_counter()
+    if update_labels and "tags" in result:
+        tags = result["tags"]
+        if result.get("semantic_model"):
+            tags = list(dict.fromkeys([*tags, result["semantic_model"]]))
+        db.update_clip(
+            clip_id,
+            status="indexed",
+            people_count=result["people_count"],
+            shot_size=result["shot_size"],
+            moods=result["moods"],
+            settings=result["settings"],
+            quality_flags=result["quality_flags"],
+            tags=tags,
+            description=result["description"],
+            embedding_path=result["embedding_path"],
+        )
+    db_update_s = time.perf_counter() - db_started
+    metadata_started = time.perf_counter()
+    _write_metadata(
+        int(movie["id"]),
+        clip_id,
+        extra={
+            "representative_frames": result.get("frame_paths", []),
+            "embedding_profile": profile.to_dict(),
+            "embeddings_per_clip": clip_embeddings,
+            "sampling_mode": sampling_mode,
+            "adaptive_sampling": {
+                "seconds_per_vector": adaptive_seconds,
+                "minimum": adaptive_min,
+                "maximum": adaptive_max,
+            } if sampling_mode != "fixed" else None,
+        },
+    )
+    metadata_s = time.perf_counter() - metadata_started
+    timing_event(
+        "semantic_clip",
+        movie_id=int(movie["id"]),
+        clip_id=clip_id,
+        clip_index=int(clip["clip_index"]),
+        profile_id=profile.id,
+        embeddings_per_clip=clip_embeddings,
+        sampling_mode=sampling_mode,
+        start_time=round(float(clip["start_time"]), 3),
+        end_time=round(float(clip["end_time"]), 3),
+        db_update_s=round(db_update_s, 4),
+        metadata_s=round(metadata_s, 4),
+        batch_frames=batch_frames,
+        **timings,
+    )
+
+
+def _analyze_siglip_profile_batched(
+    movie_id: int,
+    source: Path,
+    profile: Any,
+    embeddings_per_clip: int,
+    overwrite: bool,
+    update_labels: bool,
+    sampling_mode: str,
+    adaptive_seconds: float,
+    adaptive_min: int,
+    adaptive_max: int,
+    analyzer: SemanticAnalyzer,
+) -> None:
+    """Run one SigLIP job with up to SIGLIP_BATCH frames per model call."""
+    movie = db.get_movie(movie_id) or {}
+    clips = [clip for clip in db.list_clips({"movie_id": movie_id}) if clip["status"] != "too_short"]
+    pending: list[dict[str, Any]] = []
+    pending_frames = 0
+    batch_number = 0
+    frame_batch_limit = max(1, int(SETTINGS.siglip_batch_size))
+
+    def process_batch(batch: list[dict[str, Any]]) -> None:
+        nonlocal batch_number
+        if not batch:
+            return
+        batch_number += 1
+        first = int(batch[0]["position"])
+        last = int(batch[-1]["position"])
+        db.update_movie(
+            movie_id,
+            progress_detail=(
+                f"{profile.label}: clips {first}-{last}/{len(clips)} "
+                f"(batch {batch_number}, up to {frame_batch_limit} frames)"
+            ),
+            active_embedding_profile=profile.id,
+            embeddings_per_clip=int(batch[-1]["embeddings_per_clip"]),
+        )
+        results = analyzer.analyze_clips_batch(batch)
+        batch_frames = sum(int(result.get("embedding_count") or 0) for result in results)
+        for item, result in zip(batch, results):
+            _persist_semantic_result(
+                movie,
+                profile,
+                item["clip"],
+                int(item["embeddings_per_clip"]),
+                result,
+                update_labels=update_labels,
+                sampling_mode=sampling_mode,
+                adaptive_seconds=adaptive_seconds,
+                adaptive_min=adaptive_min,
+                adaptive_max=adaptive_max,
+                batch_frames=batch_frames,
+            )
+
+    for position, clip in enumerate(clips, start=1):
+        if _is_paused(movie_id):
+            return
+        clip_id = int(clip["id"])
+        clip_embeddings = (
+            adaptive_embeddings_per_clip(
+                float(clip.get("duration") or 0),
+                seconds_per_vector=adaptive_seconds,
+                minimum=adaptive_min,
+                maximum=adaptive_max,
+            )
+            if sampling_mode != "fixed" else embeddings_per_clip
+        )
+        existing = db.get_clip_embedding(clip_id, profile.id)
+        if (
+            not overwrite
+            and existing
+            and existing.get("status") == "complete"
+            and int(existing.get("frame_count") or 0) == clip_embeddings
+            and Path(existing.get("artifact_path") or "").exists()
+        ):
+            continue
+        saved_frames = _saved_frame_paths(clip_id)
+        estimated_frames = max(1, len(saved_frames) or clip_embeddings)
+        if pending and pending_frames + estimated_frames > frame_batch_limit:
+            process_batch(pending)
+            pending = []
+            pending_frames = 0
+        pending.append(
+            {
+                "clip": clip,
+                "clip_id": clip_id,
+                "position": position,
+                "video_path": str(source),
+                "start_time": float(clip["start_time"]),
+                "end_time": float(clip["end_time"]),
+                "embeddings_per_clip": clip_embeddings,
+                "existing_frame_paths": saved_frames,
+            }
+        )
+        pending_frames += estimated_frames
+    process_batch(pending)
+
+
 def _analyze_embedding_profile(
     movie_id: int,
     source: Path,
@@ -797,6 +975,24 @@ def _analyze_embedding_profile(
                 embeddings_per_clip=embeddings_per_clip,
                 input_size=profile.input_size,
             )
+        if profile.model_type == "siglip2":
+            try:
+                _analyze_siglip_profile_batched(
+                    movie_id,
+                    source,
+                    profile,
+                    embeddings_per_clip,
+                    overwrite,
+                    update_labels,
+                    sampling_mode,
+                    adaptive_seconds,
+                    adaptive_min,
+                    adaptive_max,
+                    analyzer,
+                )
+            finally:
+                analyzer.close()
+            return
         try:
             for position, clip in enumerate(clips, start=1):
                 if _is_paused(movie_id):

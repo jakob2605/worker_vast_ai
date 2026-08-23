@@ -159,6 +159,236 @@ class SemanticAnalyzer:
             text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
         return text_embeds[0].cpu().numpy().astype("float32")
 
+    def analyze_clips_batch(self, clip_inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Analyze several clips while keeping one model/job and batching frames.
+
+        ``SETTINGS.siglip_batch_size`` is a frame limit, not a clip limit. A
+        batch may therefore contain fewer than 64 clips when each clip has
+        several representative frames.
+        """
+        prepared: list[dict[str, Any]] = []
+        for item in clip_inputs:
+            decode_started = time.perf_counter()
+            frames = _load_saved_frames(item.get("existing_frame_paths") or [])
+            if not frames:
+                frames = sample_frames(
+                    Path(item["video_path"]),
+                    float(item["start_time"]),
+                    float(item["end_time"]),
+                    int(item["embeddings_per_clip"]),
+                    self.input_size,
+                )
+            frame_times = _sample_times(
+                float(item["start_time"]),
+                float(item["end_time"]),
+                len(frames),
+            )
+            frame_save_started = time.perf_counter()
+            frame_paths = self._save_representative_frames(frames, int(item["clip_id"]))
+            prepared.append(
+                {
+                    **item,
+                    "frames": frames,
+                    "frame_times": frame_times,
+                    "frame_paths": frame_paths,
+                    "decode_s": time.perf_counter() - decode_started,
+                    "frame_save_s": time.perf_counter() - frame_save_started,
+                }
+            )
+
+        model_load_started = time.perf_counter()
+        model_available = any(item["frames"] for item in prepared) and self._ensure_model()
+        model_load_s = time.perf_counter() - model_load_started
+        if not model_available:
+            return [
+                {
+                    **self._fallback_result(item["frames"], int(item["clip_id"]), item["frame_paths"]),
+                    "_timings": {
+                        "frames": len(item["frames"]),
+                        "device": self._device,
+                        "model_load_s": round(model_load_s, 4),
+                        "decode_s": round(item["decode_s"], 4),
+                        "frame_save_s": round(item["frame_save_s"], 4),
+                    },
+                }
+                for item in prepared
+            ]
+
+        valid = [item for item in prepared if item["frames"]]
+        all_frames = [frame for item in valid for frame in item["frames"]]
+        image_embeds, text_embeds, batch_timings = self._encode_images_batched(all_frames)
+        labels = _all_text_labels()
+        results: list[dict[str, Any]] = []
+        offset = 0
+        for item in prepared:
+            frame_count = len(item["frames"])
+            if not frame_count:
+                result = self._fallback_result([], int(item["clip_id"]), item["frame_paths"])
+                result["_timings"] = {
+                    "frames": 0,
+                    "device": self._device,
+                    "model_load_s": round(model_load_s, 4),
+                }
+                results.append(result)
+                continue
+            clip_images = image_embeds[offset : offset + frame_count]
+            offset += frame_count
+            result = self._build_siglip_result(
+                item["frames"],
+                item["frame_times"],
+                int(item["clip_id"]),
+                item["frame_paths"],
+                clip_images,
+                text_embeds,
+                labels,
+            )
+            result["_timings"].update(
+                {
+                    "device": self._device,
+                    "model_load_s": round(model_load_s, 4),
+                    "decode_s": round(item["decode_s"], 4),
+                    "frame_save_s": round(item["frame_save_s"], 4),
+                    "batch_frames": len(all_frames),
+                    **batch_timings,
+                }
+            )
+            results.append(result)
+        return results
+
+    def _encode_images_batched(
+        self,
+        frames: list[np.ndarray],
+    ) -> tuple[Any, Any, dict[str, Any]]:
+        """Encode all frames in batches and encode text labels once."""
+        started = time.perf_counter()
+        text_labels = _all_text_labels()
+        text_inputs = self._processor(
+            text=text_labels,
+            padding="max_length",
+            return_tensors="pt",
+        )
+        text_inputs = {
+            key: (value.to(self._device) if hasattr(value, "to") else value)
+            for key, value in text_inputs.items()
+        }
+        with self._torch.no_grad():
+            text_method = getattr(self._model, "get_text_features", None)
+            if not text_method:
+                raise RuntimeError("SigLIP model does not expose get_text_features")
+            try:
+                text_embeds = text_method(**text_inputs)
+            except TypeError:
+                allowed = {"input_ids", "attention_mask", "position_ids"}
+                text_embeds = text_method(
+                    **{key: value for key, value in text_inputs.items() if key in allowed}
+                )
+            text_embeds = text_embeds.float()
+            text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+
+        batch_size = max(1, int(SETTINGS.siglip_batch_size))
+        image_batches: list[Any] = []
+        batch_count = 0
+        for start in range(0, len(frames), batch_size):
+            batch_count += 1
+            images = [
+                Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                for frame in frames[start : start + batch_size]
+            ]
+            inputs = self._processor(images=images, return_tensors="pt")
+            inputs = {
+                key: (value.to(self._device) if hasattr(value, "to") else value)
+                for key, value in inputs.items()
+            }
+            if self._dtype == self._torch.float16 and "pixel_values" in inputs:
+                inputs["pixel_values"] = inputs["pixel_values"].half()
+            with self._torch.no_grad():
+                image_method = getattr(self._model, "get_image_features", None)
+                if not image_method:
+                    raise RuntimeError("SigLIP model does not expose get_image_features")
+                try:
+                    image_embeds = image_method(**inputs)
+                except TypeError:
+                    image_embeds = image_method(pixel_values=inputs["pixel_values"])
+                image_embeds = image_embeds.float()
+                image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+            self._sync_device()
+            image_batches.append(image_embeds.cpu())
+            for image in images:
+                image.close()
+
+        return (
+            self._torch.cat(image_batches, dim=0),
+            text_embeds.cpu(),
+            {
+                "inference_batches": batch_count,
+                "inference_batch_size": batch_size,
+                "batched_model_s": round(time.perf_counter() - started, 4),
+            },
+        )
+
+    def _build_siglip_result(
+        self,
+        frames: list[np.ndarray],
+        frame_times: list[float],
+        clip_id: int,
+        frame_paths: list[str],
+        image_embeds: Any,
+        text_embeds: Any,
+        text_labels: list[str],
+    ) -> dict[str, Any]:
+        embedding_started = time.perf_counter()
+        with self._torch.no_grad():
+            similarities = image_embeds @ text_embeds.T
+            mean_scores = similarities.mean(dim=0).numpy()
+            mean_embedding = image_embeds.mean(dim=0)
+            mean_embedding = mean_embedding / mean_embedding.norm().clamp_min(1e-9)
+            frame_embeddings = image_embeds.numpy().astype("float32")
+            embedding = mean_embedding.numpy().astype("float32")
+        embedding_reduce_s = time.perf_counter() - embedding_started
+
+        artifact_started = time.perf_counter()
+        scored = sorted(zip(text_labels, mean_scores), key=lambda item: float(item[1]), reverse=True)
+        embedding_path = EMBEDDING_PROFILES_DIR / self.profile_id / f"clip_{clip_id:06d}.npz"
+        embedding_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            embedding_path,
+            mean=embedding,
+            frames=frame_embeddings,
+            frame_times=np.asarray(frame_times, dtype="float32"),
+            model=np.asarray(self.model_name),
+            profile_id=np.asarray(self.profile_id),
+            normalized=np.asarray(True),
+        )
+        people_count = _best_people(scored)
+        shot_size = _best_from(
+            scored,
+            SHOT_SIZE_LABELS,
+            {"close-up face": "close_up", "medium shot person": "medium_shot", "wide shot environment": "wide_shot"},
+        )
+        if shot_size == "unknown":
+            shot_size = _heuristic_shot_size(frames)
+        moods = [label for label, _ in scored if label in MOOD_LABELS][:3]
+        settings = [label for label, _ in scored if label in SETTING_LABELS][:4]
+        tags = list(dict.fromkeys([people_count, shot_size, *moods, *settings]))
+        return {
+            "people_count": people_count,
+            "shot_size": shot_size,
+            "moods": moods,
+            "settings": settings,
+            "quality_flags": _quality_flags(frames),
+            "tags": [tag for tag in tags if tag and tag != "unknown"],
+            "description": _description(people_count, shot_size, moods, settings),
+            "embedding_path": str(embedding_path),
+            "embedding_count": int(frame_embeddings.shape[0]),
+            "embedding_dimension": int(frame_embeddings.shape[1]),
+            "frame_paths": frame_paths,
+            "semantic_model": self.model_name,
+            "_timings": {
+                "embedding_reduce_s": round(embedding_reduce_s, 4),
+                "artifact_s": round(time.perf_counter() - artifact_started, 4),
+            },
+        }
+
     def _siglip_result(
         self,
         frames: list[np.ndarray],
