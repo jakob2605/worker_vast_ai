@@ -62,7 +62,7 @@ class ProcessingSettings:
     nvenc_cq: int = int(os.getenv("NVENC_CQ", "21"))
     # How many frames to push through SigLIP at once. Batching is where most of
     # the GPU speedup comes from; on CPU keep it small.
-    siglip_batch_size: int = int(os.getenv("SIGLIP_BATCH", "32" if DEVICE == "cuda" else "5"))
+    siglip_batch_size: int = int(os.getenv("SIGLIP_BATCH", "128" if DEVICE == "cuda" else "5"))
     siglip_fp16: bool = _env_flag("SIGLIP_FP16", DEVICE == "cuda")
     export_workers: int = int(os.getenv("EXPORT_WORKERS", "4"))
 
