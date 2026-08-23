@@ -815,6 +815,11 @@ def _persist_semantic_result(
         },
     )
     metadata_s = time.perf_counter() - metadata_started
+    timing_fields = dict(timings)
+    # Batched SigLIP results already report the total frame count under this
+    # name.  Merge it before expanding the fields so timing_event() does not
+    # receive the same keyword twice.
+    timing_fields["batch_frames"] = batch_frames
     timing_event(
         "semantic_clip",
         movie_id=int(movie["id"]),
@@ -827,8 +832,7 @@ def _persist_semantic_result(
         end_time=round(float(clip["end_time"]), 3),
         db_update_s=round(db_update_s, 4),
         metadata_s=round(metadata_s, 4),
-        batch_frames=batch_frames,
-        **timings,
+        **timing_fields,
     )
 
 
