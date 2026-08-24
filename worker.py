@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import json
+import random
 import signal
 import shutil
 import subprocess
@@ -27,6 +28,40 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadF
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
+
+
+# Scores are z-scores.  Differences below this threshold are too small to
+# justify a deterministic ordering, especially because the picker displays
+# only one decimal place.  Randomizing only these bands avoids both the
+# database-order bias and accidental reordering of genuinely better matches.
+SEMANTIC_RANK_TIE_EPSILON = 0.05
+
+
+def _semantic_rank_order(scores, *, epsilon: float = SEMANTIC_RANK_TIE_EPSILON) -> list[int]:
+    """Return descending score order, randomizing only near-equal bands."""
+    import numpy as np
+
+    ordered = [int(index) for index in np.argsort(-scores, kind="stable")]
+    if len(ordered) < 2:
+        return ordered
+
+    rng = random.SystemRandom()
+    result: list[int] = []
+    start = 0
+    while start < len(ordered):
+        end = start + 1
+        lead_score = float(scores[ordered[start]])
+        while end < len(ordered):
+            score = float(scores[ordered[end]])
+            if lead_score - score > epsilon:
+                break
+            end += 1
+        band = ordered[start:end]
+        if len(band) > 1:
+            rng.shuffle(band)
+        result.extend(band)
+        start = end
+    return result
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -677,7 +712,10 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
 
     stage = time.perf_counter()
     ranked: list[dict[str, Any]] = []
-    for ci in np.argsort(-combined):
+    # Do not let the database's movie order decide between effectively tied
+    # semantic scores.  Clear score differences remain fully deterministic;
+    # only the near-equal bands are randomized.
+    for ci in _semantic_rank_order(combined):
         row = dict(candidate_rows[int(ci)])
         qi = int(winning_query[int(ci)])
         row.update({
@@ -1342,8 +1380,8 @@ def pause_job(movie_id: int) -> dict[str, Any]:
 
 @app.post("/jobs/bulk-action", dependencies=[Depends(auth)])
 def bulk_job_action(req: BulkJobActionReq) -> dict[str, Any]:
-    if req.action not in {"start", "pause", "semantics"}:
-        raise HTTPException(400, "action must be start, pause, or semantics")
+    if req.action not in {"start", "pause", "semantics", "delete"}:
+        raise HTTPException(400, "action must be start, pause, semantics, or delete")
     title = req.title.strip().casefold()
     movies = [m for m in db.list_movies() if (m.get("collection_title") or m.get("original_name") or "").strip().casefold() == title]
     results = []
@@ -1353,6 +1391,8 @@ def bulk_job_action(req: BulkJobActionReq) -> dict[str, Any]:
                 results.append(start_job(int(movie["id"])))
             elif req.action == "pause":
                 results.append(pause_job(int(movie["id"])))
+            elif req.action == "delete":
+                results.append(delete_job(int(movie["id"])))
             else:
                 results.append(rerun_semantics_job(int(movie["id"]), SemanticsReq()))
         except Exception as exc:  # bulk actions must continue past failed jobs
