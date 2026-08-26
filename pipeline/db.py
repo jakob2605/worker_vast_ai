@@ -121,11 +121,19 @@ def init_db() -> None:
                 PRIMARY KEY (clip_id, profile_id)
             );
 
+            CREATE TABLE IF NOT EXISTS worker_generations (
+                name TEXT PRIMARY KEY,
+                value INTEGER NOT NULL DEFAULT 0
+            );
+
+            INSERT OR IGNORE INTO worker_generations (name, value)
+                VALUES ('embedding', 0), ('clip_catalog', 0);
+
             CREATE INDEX IF NOT EXISTS idx_clips_movie ON clips(movie_id);
             CREATE INDEX IF NOT EXISTS idx_clips_duration ON clips(duration);
             CREATE INDEX IF NOT EXISTS idx_clips_camera ON clips(camera_motion_type);
             CREATE INDEX IF NOT EXISTS idx_clips_people ON clips(people_count);
-            CREATE INDEX IF NOT EXISTS idx_clips_shot_size ON clips(shot_size);
+        CREATE INDEX IF NOT EXISTS idx_clips_shot_size ON clips(shot_size);
             CREATE INDEX IF NOT EXISTS idx_clip_embeddings_profile ON clip_embeddings(profile_id, status);
             """
         )
@@ -189,6 +197,29 @@ def _sync_builtin_profiles(conn: sqlite3.Connection) -> None:
         )
 
 
+def _bump_generation(conn: sqlite3.Connection, name: str) -> None:
+    conn.execute(
+        "UPDATE worker_generations SET value = value + 1 WHERE name = ?",
+        (name,),
+    )
+
+
+def embedding_generation() -> int:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM worker_generations WHERE name = 'embedding'"
+        ).fetchone()
+    return int(row["value"] if row else 0)
+
+
+def clip_catalog_generation() -> int:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM worker_generations WHERE name = 'clip_catalog'"
+        ).fetchone()
+    return int(row["value"] if row else 0)
+
+
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
@@ -234,6 +265,7 @@ def create_movie(
                 collection_title, int(bool(skip_clip_detection)), float(max_blind_clip_seconds), now, now,
             ),
         )
+        _bump_generation(conn, "clip_catalog")
         return int(cur.lastrowid)
 
 
@@ -245,6 +277,8 @@ def update_movie(movie_id: int, **fields: Any) -> None:
     values = list(fields.values()) + [movie_id]
     with connect() as conn:
         conn.execute(f"UPDATE movies SET {assignments} WHERE id = ?", values)
+        if set(fields).intersection({"original_name", "filename", "path", "collection_title"}):
+            _bump_generation(conn, "clip_catalog")
 
 
 def get_movie(movie_id: int) -> dict[str, Any] | None:
@@ -318,6 +352,7 @@ def upsert_clip(movie_id: int, clip_index: int, **fields: Any) -> int:
             """,
             values,
         )
+        _bump_generation(conn, "clip_catalog")
         row = conn.execute(
             "SELECT id FROM clips WHERE movie_id = ? AND clip_index = ?",
             (movie_id, clip_index),
@@ -336,6 +371,7 @@ def update_clip(clip_id: int, **fields: Any) -> None:
     values = list(fields.values()) + [clip_id]
     with connect() as conn:
         conn.execute(f"UPDATE clips SET {assignments} WHERE id = ?", values)
+        _bump_generation(conn, "clip_catalog")
 
 
 def get_clip(clip_id: int) -> dict[str, Any] | None:
@@ -351,17 +387,23 @@ def delete_clips(clip_ids: list[int]) -> list[dict[str, Any]]:
         rows = conn.execute(f"SELECT * FROM clips WHERE id IN ({placeholders})", clip_ids).fetchall()
         clips = [row_to_dict(row) for row in rows if row is not None]
         conn.execute(f"DELETE FROM clips WHERE id IN ({placeholders})", clip_ids)
+        _bump_generation(conn, "clip_catalog")
+        _bump_generation(conn, "embedding")
     return clips
 
 
 def delete_clips_for_movie(movie_id: int) -> None:
     with connect() as conn:
         conn.execute("DELETE FROM clips WHERE movie_id = ?", (movie_id,))
+        _bump_generation(conn, "clip_catalog")
+        _bump_generation(conn, "embedding")
 
 
 def delete_movie(movie_id: int) -> None:
     with connect() as conn:
         conn.execute("DELETE FROM movies WHERE id = ?", (movie_id,))
+        _bump_generation(conn, "clip_catalog")
+        _bump_generation(conn, "embedding")
 
 
 def list_embedding_profiles(movie_id: int | None = None) -> list[dict[str, Any]]:
@@ -469,6 +511,7 @@ def upsert_clip_embedding(
                 now,
             ),
         )
+        _bump_generation(conn, "embedding")
 
 
 def _clip_where(filters: dict[str, Any] | None = None) -> tuple[list[str], list[Any]]:

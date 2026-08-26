@@ -220,6 +220,7 @@ _CLOUD_JOBS: dict[str, dict[str, Any]] = {}
 _CLOUD_JOBS_LOCK = threading.Lock()
 _EMBEDDING_CACHE: dict[str, Any] = {
     "profile_id": "",
+    "generation": -1,
     "signature": (),
     "vectors": {},
     "vector_items": {},
@@ -227,6 +228,12 @@ _EMBEDDING_CACHE: dict[str, Any] = {
     "index": None,
 }
 _EMBEDDING_CACHE_LOCK = threading.Lock()
+_CLIP_CATALOG_CACHE: dict[str, Any] = {
+    "generation": -1,
+    "rows": [],
+    "rows_by_id": {},
+}
+_CLIP_CATALOG_CACHE_LOCK = threading.Lock()
 _SEMANTIC_REQUESTS: dict[str, int] = {}
 _SEMANTIC_REQUESTS_LOCK = threading.Lock()
 _PIPELINE_EXECUTOR = ThreadPoolExecutor(
@@ -514,38 +521,48 @@ def _catalog(req: CatalogReq) -> dict[str, Any]:
 def _profile_embedding_vectors(profile_id: str) -> dict[int, tuple[Any, Any, Any]]:
     import numpy as np
 
-    records = [row for row in db.list_clip_embeddings(profile_id) if row.get("status") == "complete"]
-    # Database timestamps can change while metadata is being synchronized,
-    # even when the actual embedding artifact did not change. Use the file's
-    # identity and stat instead, so such metadata writes do not rebuild the
-    # complete 25k-clip index.
-    record_keys: dict[int, tuple[Any, ...]] = {}
-    signature_parts: list[tuple[Any, ...]] = []
-    for row in records:
-        clip_id = int(row["clip_id"])
-        path = Path(row.get("artifact_path") or "")
-        try:
-            stat = path.stat()
-            key = (clip_id, str(path), int(stat.st_size), int(stat.st_mtime_ns))
-        except OSError:
-            key = (clip_id, str(path), -1, -1)
-        record_keys[clip_id] = key
-        signature_parts.append(key)
-    signature = tuple(signature_parts)
+    generation = db.embedding_generation()
     with _EMBEDDING_CACHE_LOCK:
-        if _EMBEDDING_CACHE["profile_id"] == profile_id and _EMBEDDING_CACHE["signature"] == signature:
+        if (
+            _EMBEDDING_CACHE["profile_id"] == profile_id
+            and _EMBEDDING_CACHE["generation"] == generation
+        ):
+            return _EMBEDDING_CACHE["vectors"]
+
+    records = [row for row in db.list_clip_embeddings(profile_id) if row.get("status") == "complete"]
+
+    # The generation is bumped in the same SQLite transaction as every
+    # embedding change.  The row metadata is enough to reuse unchanged vector
+    # artifacts when only a few new clips were indexed; no per-file stat()
+    # calls are needed on every query.
+    record_keys: dict[int, tuple[Any, ...]] = {
+        int(row["clip_id"]): (
+            int(row["clip_id"]),
+            str(row.get("artifact_path") or ""),
+            int(row.get("frame_count") or 0),
+            int(row.get("dimension") or 0),
+            str(row.get("source_checksum") or ""),
+            str(row.get("updated_at") or ""),
+        )
+        for row in records
+    }
+    with _EMBEDDING_CACHE_LOCK:
+        if (
+            _EMBEDDING_CACHE["profile_id"] == profile_id
+            and _EMBEDDING_CACHE["generation"] == generation
+        ):
             return _EMBEDDING_CACHE["vectors"]
 
         vectors: dict[int, tuple[Any, Any, Any]] = {}
-        vector_items: dict[int, tuple[tuple[Any, ...], tuple[Any, Any, Any]]] = {}
+        vector_items: dict[tuple[str, int], tuple[tuple[Any, ...], tuple[Any, Any, Any]]] = {}
         old_items = _EMBEDDING_CACHE.get("vector_items") or {}
         for record in records:
             clip_id = int(record["clip_id"])
             key = record_keys[clip_id]
-            cached = old_items.get(clip_id)
+            cached = old_items.get((profile_id, clip_id))
             if cached and cached[0] == key:
                 vectors[clip_id] = cached[1]
-                vector_items[clip_id] = cached
+                vector_items[(profile_id, clip_id)] = cached
                 continue
             path = Path(record.get("artifact_path") or "")
             if path.suffix.lower() not in {".npy", ".npz"} or not path.is_file():
@@ -577,10 +594,11 @@ def _profile_embedding_vectors(profile_id: str) -> dict[int, tuple[Any, Any, Any
                 frames /= np.maximum(np.linalg.norm(frames, axis=1, keepdims=True), 1e-9)
             value = (mean, frames, times)
             vectors[clip_id] = value
-            vector_items[clip_id] = (key, value)
+            vector_items[(profile_id, clip_id)] = (key, value)
         _EMBEDDING_CACHE.update(
             profile_id=profile_id,
-            signature=signature,
+            generation=generation,
+            signature=generation,
             vectors=vectors,
             vector_items=vector_items,
             index_signature=(),
@@ -655,6 +673,46 @@ def _profile_embedding_index(profile_id: str) -> dict[str, Any]:
                 print(f"SEM_MATCH gpu_index_unavailable error={exc!r}", flush=True)
         _EMBEDDING_CACHE.update(index_signature=signature, index=index)
         return index
+
+
+def _candidate_rows(filters: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
+    """Return clip metadata, reusing the unfiltered catalog between searches."""
+    # Semantic matching always requires a playable clip.  The common picker
+    # request has no additional conventional/text filters, so cache exactly
+    # that base result.  Filtered searches keep using SQLite so their existing
+    # query semantics remain unchanged.
+    base_request = bool(filters.get("has_file")) and not any(
+        filters.get(key)
+        for key in (
+            "movie_id",
+            "collection_title",
+            "filter_query",
+            "min_duration",
+            "max_duration",
+            "camera_motion_type",
+            "animation_motion_bucket",
+            "people_count",
+            "shot_size",
+            "status",
+            "text",
+            "mood",
+            "tag",
+        )
+    )
+    if not base_request:
+        return db.list_clips(filters), False
+
+    generation = db.clip_catalog_generation()
+    with _CLIP_CATALOG_CACHE_LOCK:
+        if _CLIP_CATALOG_CACHE["generation"] == generation:
+            return _CLIP_CATALOG_CACHE["rows"], True
+
+    rows = db.list_clips({"has_file": True})
+    with _CLIP_CATALOG_CACHE_LOCK:
+        # A clip update may have happened while SQLite was reading the rows.
+        # The next request will notice the newer generation and refresh again.
+        _CLIP_CATALOG_CACHE.update(generation=generation, rows=rows)
+    return rows, False
 
 
 def _register_semantic_request(req: SemanticMatchReq) -> None:
@@ -740,7 +798,9 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
     allowed_ids = {int(clip_id) for clip_id in req.clip_ids if int(clip_id) > 0}
     candidate_rows: list[dict[str, Any]] = []
     candidate_indexes: list[int] = []
-    for row in db.list_clips(filters):
+    stage = time.perf_counter()
+    candidate_source, catalog_cache_hit = _candidate_rows(filters)
+    for row in candidate_source:
         if allowed_ids and int(row["id"]) not in allowed_ids:
             continue
         index = clip_index_by_id.get(int(row["id"]))
@@ -752,9 +812,14 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
         candidate_indexes.append(index)
 
     if not candidate_rows:
-        mark("done_empty", candidates=0)
+        mark("done_empty", stage, candidates=0, catalog_cache_hit=catalog_cache_hit)
         return []
-    mark("candidates_done", candidates=len(candidate_rows))
+    mark(
+        "candidates_done",
+        stage,
+        candidates=len(candidate_rows),
+        catalog_cache_hit=catalog_cache_hit,
+    )
     _check_semantic_request(req)
     candidate_indexes_array = np.asarray(candidate_indexes, dtype="int64")
     # Keep the candidate embedding matrix separate from the per-query score
