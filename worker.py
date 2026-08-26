@@ -37,11 +37,34 @@ from starlette.background import BackgroundTask
 SEMANTIC_RANK_TIE_EPSILON = 0.05
 
 
-def _semantic_rank_order(scores, *, epsilon: float = SEMANTIC_RANK_TIE_EPSILON) -> list[int]:
-    """Return descending score order, randomizing only near-equal bands."""
+def _semantic_rank_order(
+    scores,
+    *,
+    limit: int | None = None,
+    epsilon: float = SEMANTIC_RANK_TIE_EPSILON,
+) -> list[int]:
+    """Return descending score order, randomizing only near-equal bands.
+
+    The score vector is still calculated for every candidate.  Only the
+    expensive full sort is shortened: ``argpartition`` finds the top part and
+    we include the small near-tie band around its cutoff so the tie policy is
+    preserved.
+    """
     import numpy as np
 
-    ordered = [int(index) for index in np.argsort(-scores, kind="stable")]
+    scores = np.asarray(scores)
+    if not len(scores):
+        return []
+    if limit is None or int(limit) >= len(scores):
+        candidate_indices = np.arange(len(scores), dtype="int64")
+    else:
+        keep = max(1, min(int(limit), len(scores)))
+        rough = np.argpartition(-scores, keep - 1)[:keep]
+        cutoff = float(np.min(scores[rough]))
+        candidate_indices = np.flatnonzero(scores >= cutoff - epsilon)
+    ordered = [int(index) for index in candidate_indices[
+        np.argsort(-scores[candidate_indices], kind="stable")
+    ]]
     if len(ordered) < 2:
         return ordered
 
@@ -203,6 +226,8 @@ _EMBEDDING_CACHE: dict[str, Any] = {
     "index": None,
 }
 _EMBEDDING_CACHE_LOCK = threading.Lock()
+_SEMANTIC_REQUESTS: dict[str, int] = {}
+_SEMANTIC_REQUESTS_LOCK = threading.Lock()
 _PIPELINE_EXECUTOR = ThreadPoolExecutor(
     max_workers=1,
     thread_name_prefix="media-pipeline",
@@ -366,6 +391,12 @@ class SemanticMatchReq(BaseModel):
     filter_query: Optional[str] = None
     clip_ids: list[int] = []
     limit: int = 80
+    request_key: str = ""
+    request_id: int = 0
+
+
+class _SemanticRequestSuperseded(Exception):
+    """Internal signal used to stop work for an obsolete picker request."""
 
 
 class CatalogReq(BaseModel):
@@ -573,9 +604,52 @@ def _profile_embedding_index(profile_id: str) -> dict[str, Any]:
                             np.zeros((0,), dtype="int64"),
             "frame_times": np.concatenate(frame_times) if frame_times else
                            np.zeros((0,), dtype="float32"),
+            "torch_device": None,
+            "torch_means": None,
+            "torch_frames": None,
         }
+        # The model already runs on CUDA on the Vast box. Keep the search
+        # matrices there as well, so querying does not copy 31k clips and all
+        # representative frames through a CPU NumPy matmul on every request.
+        if SETTINGS.device == "cuda" and means.size:
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    device = torch.device("cuda")
+                    index["torch_device"] = device
+                    index["torch_means"] = torch.from_numpy(means).to(device)
+                    if index["frames"].size:
+                        index["torch_frames"] = torch.from_numpy(index["frames"]).to(device)
+            except (ImportError, RuntimeError, OSError) as exc:
+                # CPU NumPy remains a valid fallback, especially on small
+                # instances or while CUDA memory is occupied by processing.
+                print(f"SEM_MATCH gpu_index_unavailable error={exc!r}", flush=True)
         _EMBEDDING_CACHE.update(index_signature=signature, index=index)
         return index
+
+
+def _register_semantic_request(req: SemanticMatchReq) -> None:
+    key = str(req.request_key or "").strip()
+    request_id = int(req.request_id or 0)
+    if not key or request_id <= 0:
+        return
+    with _SEMANTIC_REQUESTS_LOCK:
+        # Request IDs are monotonic per picker/scene. This also protects
+        # against an older HTTP packet arriving after a newer one.
+        if request_id >= _SEMANTIC_REQUESTS.get(key, 0):
+            _SEMANTIC_REQUESTS[key] = request_id
+
+
+def _check_semantic_request(req: SemanticMatchReq) -> None:
+    key = str(req.request_key or "").strip()
+    request_id = int(req.request_id or 0)
+    if not key or request_id <= 0:
+        return
+    with _SEMANTIC_REQUESTS_LOCK:
+        current = _SEMANTIC_REQUESTS.get(key, request_id)
+    if current != request_id:
+        raise _SemanticRequestSuperseded
 
 
 def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
@@ -600,6 +674,8 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
         clip_ids=len(req.clip_ids),
         mode=req.embedding_mode,
     )
+    _register_semantic_request(req)
+    _check_semantic_request(req)
     get_profile(req.profile_id)
     if req.embedding_mode not in {"mean_only", "mean_and_frames"}:
         raise HTTPException(400, "embedding_mode must be mean_only or mean_and_frames")
@@ -612,6 +688,7 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
     vectors = np.asarray(embed_texts_for_profile(req.profile_id, texts), dtype="float32")
     vectors /= np.maximum(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-9)
     mark("text_embedding_done", stage, vectors=vectors.shape)
+    _check_semantic_request(req)
 
     filters = {
         "movie_id": req.movie_id,
@@ -628,6 +705,7 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
         frames=len(embedding_index["frames"]),
         dimension=embedding_index["means"].shape[1] if embedding_index["means"].ndim == 2 else 0,
     )
+    _check_semantic_request(req)
     clip_ids = embedding_index["clip_ids"]
     clip_index_by_id = {int(clip_id): index for index, clip_id in enumerate(clip_ids)}
     allowed_ids = {int(clip_id) for clip_id in req.clip_ids if int(clip_id) > 0}
@@ -648,13 +726,24 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
         mark("done_empty", candidates=0)
         return []
     mark("candidates_done", candidates=len(candidate_rows))
+    _check_semantic_request(req)
     candidate_indexes_array = np.asarray(candidate_indexes, dtype="int64")
     # Keep the candidate embedding matrix separate from the per-query score
     # statistics below.  The anchor pass needs the original vectors.
     candidate_means = embedding_index["means"][candidate_indexes_array]
     stage = time.perf_counter()
-    scores = np.asarray(vectors[:len(queries)], dtype="float32") @ candidate_means.T
+    torch_device = embedding_index.get("torch_device")
+    torch_means = embedding_index.get("torch_means")
+    if torch_device is not None and torch_means is not None:
+        import torch
+
+        query_tensor = torch.from_numpy(vectors[:len(queries)]).to(torch_device)
+        candidate_tensor = torch.as_tensor(candidate_indexes_array, device=torch_device)
+        scores = (query_tensor @ torch_means.index_select(0, candidate_tensor).T).float().cpu().numpy()
+    else:
+        scores = np.asarray(vectors[:len(queries)], dtype="float32") @ candidate_means.T
     mark("mean_scores_done", stage, shape=scores.shape)
+    _check_semantic_request(req)
     best_times = np.zeros((len(queries), len(candidate_rows)), dtype="float32")
     frame_weight = 0.0 if req.embedding_mode == "mean_only" else min(1.0, max(0.0, req.frame_weight))
     if frame_weight and embedding_index["frames"].size:
@@ -668,8 +757,24 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
         frame_value_times = embedding_index["frame_times"][frame_mask]
         if frame_values.size:
             stage = time.perf_counter()
+            if torch_device is not None and embedding_index.get("torch_frames") is not None:
+                import torch
+
+                frame_tensor = torch.as_tensor(
+                    np.flatnonzero(frame_mask), device=torch_device
+                )
+                query_tensor = torch.from_numpy(vectors[:len(queries)]).to(torch_device)
+                frame_scores_matrix = (
+                    query_tensor @ embedding_index["torch_frames"].index_select(0, frame_tensor).T
+                ).float().cpu().numpy()
+            else:
+                frame_scores_matrix = None
             for qi, query in enumerate(vectors[:len(queries)]):
-                frame_scores = frame_values @ query
+                frame_scores = (
+                    frame_scores_matrix[qi]
+                    if frame_scores_matrix is not None
+                    else frame_values @ query
+                )
                 best_frame_scores = np.full(len(candidate_rows), -np.inf, dtype="float32")
                 np.maximum.at(best_frame_scores, frame_owners, frame_scores)
                 best_frame_scores = np.maximum(best_frame_scores, scores[qi])
@@ -686,6 +791,7 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
                         best_score[owner] = frame_score
                         best_times[qi, owner] = frame_time
             mark("frame_scores_done", stage, frames=len(frame_values), queries=len(queries))
+            _check_semantic_request(req)
     else:
         mark("frame_scores_skipped", reason="mean_only_or_no_frames")
     stage = time.perf_counter()
@@ -698,9 +804,24 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
     if anchor:
         stage = time.perf_counter()
         anchor_vector = vectors[-1]
-        anchor_scores = candidate_means @ anchor_vector
+        if torch_device is not None and torch_means is not None:
+            import torch
+
+            anchor_tensor = torch.from_numpy(anchor_vector).to(torch_device)
+            candidate_tensor = torch.as_tensor(candidate_indexes_array, device=torch_device)
+            anchor_scores = (
+                torch_means.index_select(0, candidate_tensor) @ anchor_tensor
+            ).float().cpu().numpy()
+        else:
+            anchor_scores = candidate_means @ anchor_vector
         if frame_weight and embedding_index["frames"].size:
-            anchor_frame_scores = embedding_index["frames"] @ anchor_vector
+            if torch_device is not None and embedding_index.get("torch_frames") is not None:
+                anchor_frame_scores = (
+                    embedding_index["torch_frames"]
+                    @ torch.from_numpy(anchor_vector).to(torch_device)
+                ).float().cpu().numpy()
+            else:
+                anchor_frame_scores = embedding_index["frames"] @ anchor_vector
             best_anchor_frames = np.full(len(clip_ids), -np.inf, dtype="float32")
             np.maximum.at(best_anchor_frames, embedding_index["frame_owners"], anchor_frame_scores)
             best_anchor_frames = np.maximum(best_anchor_frames[candidate_indexes_array], anchor_scores)
@@ -709,13 +830,15 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
         weight = min(1.0, max(0.0, req.anchor_weight))
         combined = (1.0 - weight) * combined + weight * anchor_z
         mark("anchor_done", stage)
+        _check_semantic_request(req)
 
     stage = time.perf_counter()
     ranked: list[dict[str, Any]] = []
     # Do not let the database's movie order decide between effectively tied
     # semantic scores.  Clear score differences remain fully deterministic;
     # only the near-equal bands are randomized.
-    for ci in _semantic_rank_order(combined):
+    requested_limit = max(1, min(int(req.limit), 10000))
+    for ci in _semantic_rank_order(combined, limit=requested_limit):
         row = dict(candidate_rows[int(ci)])
         qi = int(winning_query[int(ci)])
         row.update({
@@ -728,7 +851,7 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
             "embedding_mode": req.embedding_mode,
         })
         ranked.append(row)
-        if len(ranked) >= max(1, min(int(req.limit), 10000)):
+        if len(ranked) >= requested_limit:
             break
     mark("done", stage, results=len(ranked), total=time.perf_counter() - started)
     return ranked
@@ -740,6 +863,24 @@ def startup() -> None:
     db.init_db()
     # Keep Whisper resident on the GPU alongside the worker's other models.
     warm_whisper_model()
+    # Build the default search index once in the background. The first picker
+    # request then reuses the RAM/GPU-resident matrices instead of paying the
+    # cost of opening every embedding artifact.
+    def warm_default_search_index() -> None:
+        try:
+            started = time.perf_counter()
+            index = _profile_embedding_index(DEFAULT_PROFILE_ID)
+            print(
+                "SEM_MATCH warm_index_done"
+                f" seconds={time.perf_counter() - started:.3f}"
+                f" clips={len(index['clip_ids'])}"
+                f" gpu={bool(index.get('torch_device'))}",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"SEM_MATCH warm_index_failed error={exc!r}", flush=True)
+
+    threading.Thread(target=warm_default_search_index, daemon=True).start()
     # A UI disconnect or worker restart must not lose an in-progress migration.
     # The request state is local and mode 0600; it is removed only after the
     # destination has validated and activated the new library.
@@ -1567,6 +1708,17 @@ def clip_thumbnail(clip_id: int) -> FileResponse:
 def semantic_match(req: SemanticMatchReq) -> dict[str, Any]:
     try:
         matches = _semantic_match(req)
+    except _SemanticRequestSuperseded:
+        # The local picker has already moved on. Return a small successful
+        # response so the old request does not become an error or trigger a
+        # fallback keyword search in the dashboard.
+        return {
+            "matches": [],
+            "count": 0,
+            "profile_id": req.profile_id,
+            "embedding_mode": req.embedding_mode,
+            "cancelled": True,
+        }
     except FilterQueryError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {
