@@ -222,6 +222,7 @@ _EMBEDDING_CACHE: dict[str, Any] = {
     "profile_id": "",
     "signature": (),
     "vectors": {},
+    "vector_items": {},
     "index_signature": (),
     "index": None,
 }
@@ -514,16 +515,38 @@ def _profile_embedding_vectors(profile_id: str) -> dict[int, tuple[Any, Any, Any
     import numpy as np
 
     records = [row for row in db.list_clip_embeddings(profile_id) if row.get("status") == "complete"]
-    signature = tuple(
-        (int(row["clip_id"]), str(row.get("updated_at") or ""), str(row.get("artifact_path") or ""))
-        for row in records
-    )
+    # Database timestamps can change while metadata is being synchronized,
+    # even when the actual embedding artifact did not change. Use the file's
+    # identity and stat instead, so such metadata writes do not rebuild the
+    # complete 25k-clip index.
+    record_keys: dict[int, tuple[Any, ...]] = {}
+    signature_parts: list[tuple[Any, ...]] = []
+    for row in records:
+        clip_id = int(row["clip_id"])
+        path = Path(row.get("artifact_path") or "")
+        try:
+            stat = path.stat()
+            key = (clip_id, str(path), int(stat.st_size), int(stat.st_mtime_ns))
+        except OSError:
+            key = (clip_id, str(path), -1, -1)
+        record_keys[clip_id] = key
+        signature_parts.append(key)
+    signature = tuple(signature_parts)
     with _EMBEDDING_CACHE_LOCK:
         if _EMBEDDING_CACHE["profile_id"] == profile_id and _EMBEDDING_CACHE["signature"] == signature:
             return _EMBEDDING_CACHE["vectors"]
 
         vectors: dict[int, tuple[Any, Any, Any]] = {}
+        vector_items: dict[int, tuple[tuple[Any, ...], tuple[Any, Any, Any]]] = {}
+        old_items = _EMBEDDING_CACHE.get("vector_items") or {}
         for record in records:
+            clip_id = int(record["clip_id"])
+            key = record_keys[clip_id]
+            cached = old_items.get(clip_id)
+            if cached and cached[0] == key:
+                vectors[clip_id] = cached[1]
+                vector_items[clip_id] = cached
+                continue
             path = Path(record.get("artifact_path") or "")
             if path.suffix.lower() not in {".npy", ".npz"} or not path.is_file():
                 continue
@@ -552,11 +575,14 @@ def _profile_embedding_vectors(profile_id: str) -> dict[int, tuple[Any, Any, Any
             mean /= max(float(np.linalg.norm(mean)), 1e-9)
             if frames.size:
                 frames /= np.maximum(np.linalg.norm(frames, axis=1, keepdims=True), 1e-9)
-            vectors[int(record["clip_id"])] = (mean, frames, times)
+            value = (mean, frames, times)
+            vectors[clip_id] = value
+            vector_items[clip_id] = (key, value)
         _EMBEDDING_CACHE.update(
             profile_id=profile_id,
             signature=signature,
             vectors=vectors,
+            vector_items=vector_items,
             index_signature=(),
             index=None,
         )
@@ -575,6 +601,7 @@ def _profile_embedding_index(profile_id: str) -> dict[str, Any]:
             and _EMBEDDING_CACHE["profile_id"] == profile_id
             and _EMBEDDING_CACHE["index_signature"] == signature
         ):
+            _EMBEDDING_CACHE["index"]["cache_hit"] = True
             return _EMBEDDING_CACHE["index"]
 
         clip_ids = np.asarray(sorted(vectors), dtype="int64")
@@ -607,6 +634,7 @@ def _profile_embedding_index(profile_id: str) -> dict[str, Any]:
             "torch_device": None,
             "torch_means": None,
             "torch_frames": None,
+            "cache_hit": False,
         }
         # The model already runs on CUDA on the Vast box. Keep the search
         # matrices there as well, so querying does not copy 31k clips and all
@@ -704,6 +732,7 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
         clips=len(embedding_index["clip_ids"]),
         frames=len(embedding_index["frames"]),
         dimension=embedding_index["means"].shape[1] if embedding_index["means"].ndim == 2 else 0,
+        cache_hit=bool(embedding_index.get("cache_hit")),
     )
     _check_semantic_request(req)
     clip_ids = embedding_index["clip_ids"]
