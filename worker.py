@@ -99,7 +99,11 @@ from pipeline.config import (  # noqa: E402
     SETTINGS,
     ensure_library_dirs,
 )
-from pipeline.filter_query import FilterQueryError  # noqa: E402
+from pipeline.filter_query import (  # noqa: E402
+    FilterClause,
+    FilterQueryError,
+    parse_filter_query,
+)
 from pipeline.cloud_backup import (  # noqa: E402
     create_snapshot,
     list_snapshots,
@@ -675,44 +679,153 @@ def _profile_embedding_index(profile_id: str) -> dict[str, Any]:
         return index
 
 
-def _candidate_rows(filters: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
-    """Return clip metadata, reusing the unfiltered catalog between searches."""
-    # Semantic matching always requires a playable clip.  The common picker
-    # request has no additional conventional/text filters, so cache exactly
-    # that base result.  Filtered searches keep using SQLite so their existing
-    # query semantics remain unchanged.
-    base_request = bool(filters.get("has_file")) and not any(
-        filters.get(key)
-        for key in (
-            "movie_id",
-            "collection_title",
-            "filter_query",
-            "min_duration",
-            "max_duration",
-            "camera_motion_type",
-            "animation_motion_bucket",
-            "people_count",
-            "shot_size",
-            "status",
-            "text",
-            "mood",
-            "tag",
-        )
-    )
-    if not base_request:
-        return db.list_clips(filters), False
+def _people_number(value: Any) -> int:
+    return {
+        "none": 0,
+        "one": 1,
+        "two": 2,
+        "group": 3,
+    }.get(str(value or "").strip().lower(), -1)
 
+
+def _row_text(value: Any) -> str:
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=True)
+    return str(value or "")
+
+
+def _json_contains(row: dict[str, Any], field: str, value: str) -> bool:
+    return f'"{value.lower()}"' in _row_text(row.get(field)).lower()
+
+
+def _compare_number(actual: float, operator: str, expected: float) -> bool:
+    if operator == "=":
+        return actual == expected
+    if operator == "!=":
+        return actual != expected
+    if operator == ">":
+        return actual > expected
+    if operator == ">=":
+        return actual >= expected
+    if operator == "<":
+        return actual < expected
+    if operator == "<=":
+        return actual <= expected
+    return False
+
+
+def _matches_filter_clause(row: dict[str, Any], clause: FilterClause) -> bool:
+    field = clause.field
+    values = clause.values
+    if field == "title":
+        actual = str(row.get("collection_title") or "").lower()
+        expected = [value.lower() for value in values]
+        return any(actual == value for value in expected) if clause.operator == "=" else all(actual != value for value in expected)
+
+    if field == "people":
+        actual = _people_number(row.get("people_count"))
+        expected = [float(value) for value in values]
+        if clause.operator == "=" and len(expected) > 1:
+            return actual in {int(value) for value in expected}
+        return _compare_number(float(actual), clause.operator, expected[0])
+
+    if field in {"minsec", "maxsec", "duration"}:
+        actual = float(row.get("duration") or 0)
+        expected = float(values[0])
+        operator = clause.operator
+        if field == "minsec" and operator == "=":
+            operator = ">="
+        elif field == "maxsec" and operator == "=":
+            operator = "<="
+        return _compare_number(actual, operator, expected)
+
+    if field in {"shot", "camera", "motion"}:
+        column = {
+            "shot": "shot_size",
+            "camera": "camera_motion_type",
+            "motion": "animation_motion_bucket",
+        }[field]
+        actual = str(row.get(column) or "").lower()
+        expected = {value.lower() for value in values}
+        return actual in expected if clause.operator == "=" else actual not in expected
+
+    if field in {"mood", "tag"}:
+        column = "moods" if field == "mood" else "tags"
+        matches = [_json_contains(row, column, value) for value in values]
+        return any(matches) if clause.operator == "=" else not any(matches)
+
+    if field == "files":
+        has_file = bool(str(row.get("clip_path") or "").strip())
+        expected = values[0].lower() in {"true", "yes", "1"}
+        return has_file == expected if clause.operator == "=" else has_file != expected
+
+    return False
+
+
+def _matches_filters(row: dict[str, Any], filters: dict[str, Any], clauses: list[FilterClause]) -> bool:
+    if filters.get("movie_id") and int(row.get("movie_id") or 0) != int(filters["movie_id"]):
+        return False
+    if filters.get("collection_title") and row.get("collection_title") != filters["collection_title"]:
+        return False
+    if filters.get("min_duration") is not None and float(row.get("duration") or 0) < float(filters["min_duration"]):
+        return False
+    if filters.get("max_duration") is not None and float(row.get("duration") or 0) > float(filters["max_duration"]):
+        return False
+    direct_fields = (
+        ("camera_motion_type", "camera_motion_type"),
+        ("animation_motion_bucket", "animation_motion_bucket"),
+        ("people_count", "people_count"),
+        ("shot_size", "shot_size"),
+        ("status", "status"),
+    )
+    for filter_name, row_name in direct_fields:
+        if filters.get(filter_name) and row.get(row_name) != filters[filter_name]:
+            return False
+    if filters.get("has_file") and not str(row.get("clip_path") or "").strip():
+        return False
+
+    text = str(filters.get("text") or "").strip().lower()
+    if text:
+        if not any(
+            text in _row_text(row.get(field)).lower()
+            for field in ("description", "user_notes", "tags", "moods", "settings")
+        ):
+            return False
+    mood = str(filters.get("mood") or "").strip().lower()
+    if mood and not _json_contains(row, "moods", mood):
+        return False
+    tag = str(filters.get("tag") or "").strip().lower()
+    if tag and not _json_contains(row, "tags", tag):
+        return False
+    return all(_matches_filter_clause(row, clause) for clause in clauses)
+
+
+def _candidate_rows(filters: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
+    """Return semantic candidates from a generation-keyed in-memory catalog."""
+    # Validate advanced syntax before refreshing a cold catalog, matching the
+    # old SQL path's error behavior.
+    clauses = parse_filter_query((filters.get("filter_query") or "").strip())
     generation = db.clip_catalog_generation()
     with _CLIP_CATALOG_CACHE_LOCK:
-        if _CLIP_CATALOG_CACHE["generation"] == generation:
-            return _CLIP_CATALOG_CACHE["rows"], True
+        cached_generation = _CLIP_CATALOG_CACHE["generation"]
+        rows = _CLIP_CATALOG_CACHE["rows"]
+    if cached_generation != generation:
+        # The base catalog is the only SQLite read required for semantic
+        # filtering.  All conventional and advanced filters are applied to it
+        # in memory below, avoiding a repeated 31k-row SQL/JSON scan.
+        rows = db.list_clips({"has_file": True})
+        with _CLIP_CATALOG_CACHE_LOCK:
+            _CLIP_CATALOG_CACHE.update(
+                generation=generation,
+                rows=rows,
+                rows_by_id={int(row["id"]): row for row in rows},
+            )
+        catalog_cache_hit = False
+    else:
+        catalog_cache_hit = True
 
-    rows = db.list_clips({"has_file": True})
-    with _CLIP_CATALOG_CACHE_LOCK:
-        # A clip update may have happened while SQLite was reading the rows.
-        # The next request will notice the newer generation and refresh again.
-        _CLIP_CATALOG_CACHE.update(generation=generation, rows=rows)
-    return rows, False
+    filtered = [row for row in rows if _matches_filters(row, filters, clauses)]
+    return filtered, catalog_cache_hit
 
 
 def _register_semantic_request(req: SemanticMatchReq) -> None:
