@@ -74,6 +74,10 @@ POST /migrations             direct server-to-server migration via rclone/SFTP
 GET  /migrations/jobs/{id}   migration progress
 GET  /storage                disk used by movies/clips/frames/embeddings
 POST /purge                  delete source movies, keep clips
+POST /cleanup/aesthetic/score {movie_id, sample_frames}  score one movie asynchronously
+GET  /cleanup/aesthetic/scores?movie_id=…                  read saved aesthetic scores
+GET  /cleanup/jobs/{id}                                     score-job progress
+POST /cleanup/clips {clip_ids, confirmation:"DELETE CLIPS"} delete selected clip artifacts
 ```
 
 The worker also exposes `GET /whisper` for model state and `POST /transcribe`

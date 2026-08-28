@@ -92,6 +92,7 @@ from pipeline import db  # noqa: E402
 from pipeline.config import (  # noqa: E402
     CLIPS_DIR,
     EMBEDDINGS_DIR,
+    EMBEDDING_PROFILES_DIR,
     FRAMES_DIR,
     LIBRARY_DIR,
     METADATA_DIR,
@@ -141,6 +142,7 @@ from pipeline.whisper import (  # noqa: E402
     transcribe_url as transcribe_media_url,
     warm_model as warm_whisper_model,
 )
+from pipeline.aesthetic import delete_scores, load_scores, score_movie  # noqa: E402
 from pipeline.video_tools import (  # noqa: E402
     convert_gif_to_mp4,
     ffprobe,
@@ -1484,6 +1486,15 @@ class SemanticsReq(BaseModel):
     adaptive_max: int = 16
 
 
+class AestheticScoreReq(BaseModel):
+    sample_frames: int = 8
+
+
+class CleanupClipsReq(BaseModel):
+    clip_ids: list[int]
+    confirmation: str = ""
+
+
 @app.post("/jobs", dependencies=[Depends(auth)])
 def create_jobs(req: IngestReq) -> dict[str, Any]:
     """Queue one or more movie URLs. Downloads happen here, at datacenter speed."""
@@ -1772,6 +1783,89 @@ def rerun_semantics_job(movie_id: int, req: SemanticsReq) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"started": started, "movie": db.get_movie(movie_id), "profile": profile.to_dict()}
+
+
+@app.post("/cleanup/aesthetic/score", dependencies=[Depends(auth)])
+def start_aesthetic_score(movie_id: int, req: AestheticScoreReq) -> dict[str, Any]:
+    movie = db.get_movie(movie_id)
+    if not movie:
+        raise HTTPException(404, "Movie not found")
+    if is_processing(movie_id):
+        raise HTTPException(409, "Pause the movie job before scoring its clips.")
+    sample_frames = max(1, min(32, int(req.sample_frames)))
+    job_id = start_cloud_job("aesthetic", score_movie, movie_id, sample_frames=sample_frames)
+    return {"started": True, "job_id": job_id, "movie_id": movie_id, "sample_frames": sample_frames}
+
+
+@app.get("/cleanup/aesthetic/scores", dependencies=[Depends(auth)])
+def aesthetic_scores(movie_id: int) -> dict[str, Any]:
+    if not db.get_movie(movie_id):
+        raise HTTPException(404, "Movie not found")
+    rows = [row for row in load_scores().values() if int(row.get("movie_id") or 0) == int(movie_id)]
+    rows.sort(key=lambda row: (float(row.get("mean_score") or 0), int(row.get("clip_id") or 0)))
+    return {"movie_id": movie_id, "scores": rows, "count": len(rows)}
+
+
+@app.get("/cleanup/jobs/{job_id}", dependencies=[Depends(auth)])
+def cleanup_job(job_id: str) -> dict[str, Any]:
+    with _CLOUD_JOBS_LOCK:
+        job = _CLOUD_JOBS.get(job_id)
+        if not job:
+            raise HTTPException(404, "Cleanup job not found")
+        return dict(job)
+
+
+def _delete_clip_artifacts(clip: dict[str, Any]) -> int:
+    """Remove every derived artifact belonging to one clip, across profiles."""
+    removed = 0
+    for key in ("clip_path", "metadata_path", "embedding_path"):
+        value = clip.get(key)
+        if value:
+            path = Path(str(value))
+            if path.is_file():
+                path.unlink(missing_ok=True)
+                removed += 1
+    clip_name = f"clip_{int(clip['id']):06d}"
+    frame_dirs = [FRAMES_DIR / clip_name]
+    frame_dirs.extend(path for path in FRAMES_DIR.glob(f"*/{clip_name}") if path.is_dir())
+    for path in frame_dirs:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+    for path in EMBEDDING_PROFILES_DIR.glob(f"*/{clip_name}.*"):
+        if path.is_file():
+            path.unlink(missing_ok=True)
+            removed += 1
+    return removed
+
+
+@app.post("/cleanup/clips", dependencies=[Depends(auth)])
+def cleanup_clips(req: CleanupClipsReq) -> dict[str, Any]:
+    ids = sorted({int(value) for value in req.clip_ids if int(value) > 0})
+    if not ids:
+        raise HTTPException(400, "clip_ids must not be empty")
+    if len(ids) > 100000:
+        raise HTTPException(400, "At most 100000 clips can be deleted per request")
+    if req.confirmation != "DELETE CLIPS":
+        raise HTTPException(400, 'confirmation must be exactly "DELETE CLIPS"')
+    clips = [db.get_clip(clip_id) for clip_id in ids]
+    clips = [clip for clip in clips if clip]
+    if len(clips) != len(ids):
+        raise HTTPException(404, "At least one selected clip no longer exists")
+    active_movies = {int(movie_id) for movie_id in running_movie_ids()}
+    selected_movies = {int(clip["movie_id"]) for clip in clips}
+    if active_movies.intersection(selected_movies):
+        raise HTTPException(409, "Pause the affected movie job before deleting clips")
+    files_removed = sum(_delete_clip_artifacts(clip) for clip in clips)
+    deleted = db.delete_clips(ids)
+    aesthetic_removed = delete_scores(ids)
+    return {
+        "deleted": True,
+        "clips_removed": len(deleted),
+        "files_removed": files_removed,
+        "aesthetic_scores_removed": aesthetic_removed,
+        "movie_ids": sorted(selected_movies),
+    }
 
 
 @app.delete("/jobs/{movie_id}", dependencies=[Depends(auth)])
