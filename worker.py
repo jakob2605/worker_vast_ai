@@ -142,7 +142,7 @@ from pipeline.whisper import (  # noqa: E402
     transcribe_url as transcribe_media_url,
     warm_model as warm_whisper_model,
 )
-from pipeline.aesthetic import delete_scores, load_scores, score_movie  # noqa: E402
+from pipeline.aesthetic import delete_scores, load_scores, score_all_movies, score_movie  # noqa: E402
 from pipeline.video_tools import (  # noqa: E402
     convert_gif_to_mp4,
     ffprobe,
@@ -484,7 +484,10 @@ def _catalog(req: CatalogReq) -> dict[str, Any]:
 
     facets = _catalog_facets(rows)
     start = max(0, int(req.offset))
-    stop = start + max(0, min(int(req.limit), 10000))
+    # A zero limit is intentionally a summary request. Otherwise return the
+    # complete requested slice; the picker uses this to search the full
+    # filtered catalogue instead of silently stopping at 10,000.
+    stop = start + max(0, int(req.limit))
     public_rows = []
     for row in rows[start:stop]:
         clip_id = int(row["id"])
@@ -495,6 +498,10 @@ def _catalog(req: CatalogReq) -> dict[str, Any]:
             "start_time": float(row.get("start_time") or 0),
             "end_time": float(row.get("end_time") or 0),
             "duration": float(row.get("duration") or 0),
+            "aesthetic_score": (
+                float(row["aesthetic_avg"])
+                if row.get("aesthetic_avg") is not None else None
+            ),
             "collection_title": str(row.get("collection_title") or ""),
             "original_name": str(row.get("movie_original_name") or ""),
             "description": str(row.get("description") or ""),
@@ -1046,7 +1053,9 @@ def _semantic_match(req: SemanticMatchReq) -> list[dict[str, Any]]:
     # Do not let the database's movie order decide between effectively tied
     # semantic scores.  Clear score differences remain fully deterministic;
     # only the near-equal bands are randomized.
-    requested_limit = max(1, min(int(req.limit), 10000))
+    # The caller decides how many ranked rows it needs. Do not impose a hidden
+    # 10,000-result ceiling: semantic search already evaluates all candidates.
+    requested_limit = max(1, int(req.limit))
     for ci in _semantic_rank_order(combined, limit=requested_limit):
         row = dict(candidate_rows[int(ci)])
         qi = int(winning_query[int(ci)])
@@ -1787,14 +1796,19 @@ def rerun_semantics_job(movie_id: int, req: SemanticsReq) -> dict[str, Any]:
 
 @app.post("/cleanup/aesthetic/score", dependencies=[Depends(auth)])
 def start_aesthetic_score(movie_id: int, req: AestheticScoreReq) -> dict[str, Any]:
-    movie = db.get_movie(movie_id)
-    if not movie:
+    movie = db.get_movie(movie_id) if movie_id > 0 else None
+    if movie_id > 0 and not movie:
         raise HTTPException(404, "Movie not found")
-    if is_processing(movie_id):
+    if movie_id > 0 and is_processing(movie_id):
         raise HTTPException(409, "Pause the movie job before scoring its clips.")
+    if movie_id <= 0 and running_movie_ids():
+        raise HTTPException(409, "Pause all movie jobs before scoring all movies.")
     sample_frames = max(1, min(32, int(req.sample_frames)))
-    job_id = start_cloud_job("aesthetic", score_movie, movie_id, sample_frames=sample_frames)
-    return {"started": True, "job_id": job_id, "movie_id": movie_id, "sample_frames": sample_frames}
+    operation = score_movie if movie_id > 0 else score_all_movies
+    args = (movie_id,) if movie_id > 0 else ()
+    job_id = start_cloud_job("aesthetic", operation, *args, sample_frames=sample_frames)
+    return {"started": True, "job_id": job_id, "movie_id": movie_id or None,
+            "all_movies": movie_id <= 0, "sample_frames": sample_frames}
 
 
 @app.get("/cleanup/aesthetic/scores", dependencies=[Depends(auth)])

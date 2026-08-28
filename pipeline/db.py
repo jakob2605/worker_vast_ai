@@ -121,6 +121,17 @@ def init_db() -> None:
                 PRIMARY KEY (clip_id, profile_id)
             );
 
+            CREATE TABLE IF NOT EXISTS aesthetic_scores (
+                clip_id INTEGER PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
+                model_version TEXT NOT NULL,
+                sample_count INTEGER NOT NULL DEFAULT 0,
+                sampled_scores TEXT NOT NULL DEFAULT '[]',
+                mean_score REAL,
+                min_score REAL,
+                max_score REAL,
+                scored_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS worker_generations (
                 name TEXT PRIMARY KEY,
                 value INTEGER NOT NULL DEFAULT 0
@@ -135,6 +146,7 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_clips_people ON clips(people_count);
         CREATE INDEX IF NOT EXISTS idx_clips_shot_size ON clips(shot_size);
             CREATE INDEX IF NOT EXISTS idx_clip_embeddings_profile ON clip_embeddings(profile_id, status);
+            CREATE INDEX IF NOT EXISTS idx_aesthetic_scores_mean ON aesthetic_scores(mean_score);
             """
         )
         _migrate(conn)
@@ -451,6 +463,76 @@ def get_clip_embedding(clip_id: int, profile_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+def upsert_aesthetic_score(
+    clip_id: int,
+    *,
+    model_version: str,
+    sampled_scores: list[float],
+    mean_score: float,
+    min_score: float,
+    max_score: float,
+    scored_at: str | None = None,
+) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO aesthetic_scores
+                (clip_id, model_version, sample_count, sampled_scores,
+                 mean_score, min_score, max_score, scored_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(clip_id) DO UPDATE SET
+                model_version = excluded.model_version,
+                sample_count = excluded.sample_count,
+                sampled_scores = excluded.sampled_scores,
+                mean_score = excluded.mean_score,
+                min_score = excluded.min_score,
+                max_score = excluded.max_score,
+                scored_at = excluded.scored_at
+            """,
+            (
+                int(clip_id), model_version, len(sampled_scores),
+                json_text([round(float(value), 5) for value in sampled_scores]),
+                float(mean_score), float(min_score), float(max_score),
+                scored_at or utc_now(),
+            ),
+        )
+
+
+def list_aesthetic_scores(movie_id: int | None = None) -> list[dict[str, Any]]:
+    sql = """
+        SELECT a.*, c.movie_id, c.clip_index, c.start_time, c.end_time
+        FROM aesthetic_scores a
+        JOIN clips c ON c.id = a.clip_id
+    """
+    values: list[Any] = []
+    if movie_id is not None:
+        sql += " WHERE c.movie_id = ?"
+        values.append(int(movie_id))
+    sql += " ORDER BY c.movie_id, c.clip_index"
+    with connect() as conn:
+        rows = conn.execute(sql, values).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["sampled_scores"] = json.loads(item.get("sampled_scores") or "[]")
+        except json.JSONDecodeError:
+            item["sampled_scores"] = []
+        result.append(item)
+    return result
+
+
+def delete_aesthetic_scores(clip_ids: list[int]) -> int:
+    if not clip_ids:
+        return 0
+    placeholders = ", ".join("?" for _ in clip_ids)
+    with connect() as conn:
+        cursor = conn.execute(
+            f"DELETE FROM aesthetic_scores WHERE clip_id IN ({placeholders})", clip_ids
+        )
+    return int(cursor.rowcount or 0)
+
+
 def list_clip_embeddings(profile_id: str, movie_id: int | None = None) -> list[dict[str, Any]]:
     sql = """
         SELECT ce.*, c.movie_id, c.clip_index, c.clip_path, c.start_time, c.end_time,
@@ -652,10 +734,12 @@ def list_clips(
     where, values = _clip_where(filters)
 
     sql = """
-        SELECT clips.*, movies.collection_title AS collection_title,
+        SELECT clips.*, aesthetic_scores.mean_score AS aesthetic_avg,
+               movies.collection_title AS collection_title,
                movies.original_name AS movie_original_name
         FROM clips
         LEFT JOIN movies ON movies.id = clips.movie_id
+        LEFT JOIN aesthetic_scores ON aesthetic_scores.clip_id = clips.id
     """
     if where:
         sql += " WHERE " + " AND ".join(where)

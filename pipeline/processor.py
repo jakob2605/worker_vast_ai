@@ -17,6 +17,7 @@ import uuid
 from urllib.parse import unquote, urlparse
 
 from . import db
+from .aesthetic import score_movie
 from .config import (
     CLIPS_DIR,
     DOWNLOAD_LINKS_PATH,
@@ -531,6 +532,12 @@ def process_movie(movie_id: int) -> None:
             outcome = "paused"
             return
 
+        db.update_movie(movie_id, progress_stage="aesthetic_scoring", progress_detail="Scoring adaptive frames")
+        _timed_call(movie_id, "aesthetic_scoring", _analyze_missing_aesthetics, movie_id)
+        if _is_paused(movie_id):
+            outcome = "paused"
+            return
+
         db.update_movie(movie_id, progress_stage="metadata_export", progress_detail="Writing metadata sidecars")
         _timed_call(movie_id, "metadata_export", _write_all_metadata, movie_id)
         db.update_movie(movie_id, status="complete", progress_stage="complete", progress_detail="Complete", error=None)
@@ -597,6 +604,11 @@ def process_semantics_only(
             adaptive_min,
             adaptive_max,
         )
+        if _is_paused(movie_id):
+            outcome = "paused"
+            return
+        db.update_movie(movie_id, progress_stage="aesthetic_scoring", progress_detail="Scoring adaptive frames")
+        _timed_call(movie_id, "aesthetic_scoring", _analyze_missing_aesthetics, movie_id)
         if _is_paused(movie_id):
             outcome = "paused"
             return
@@ -740,6 +752,18 @@ def _analyze_missing_semantics(movie_id: int, source: Path) -> None:
         3,
         16,
     )
+
+
+def _analyze_missing_aesthetics(movie_id: int) -> None:
+    """Score only the adaptive representative frames already stored on disk."""
+    def progress(message: str, _value: float) -> None:
+        db.update_movie(
+            movie_id,
+            progress_stage="aesthetic_scoring",
+            progress_detail=message,
+        )
+
+    score_movie(movie_id, progress=progress)
 
 
 def _saved_frame_paths(clip_id: int) -> list[str]:
