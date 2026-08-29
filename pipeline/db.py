@@ -56,6 +56,7 @@ def init_db() -> None:
                 device TEXT DEFAULT '',
                 skip_clip_detection INTEGER NOT NULL DEFAULT 0,
                 max_blind_clip_seconds REAL NOT NULL DEFAULT 20.0,
+                was_gif INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -150,6 +151,7 @@ def init_db() -> None:
             """
         )
         _migrate(conn)
+        _infer_gif_flags(conn)
         _sync_builtin_profiles(conn)
 
 
@@ -163,6 +165,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "device": "TEXT DEFAULT ''",
             "skip_clip_detection": "INTEGER NOT NULL DEFAULT 0",
             "max_blind_clip_seconds": "REAL NOT NULL DEFAULT 20.0",
+            "was_gif": "INTEGER NOT NULL DEFAULT 0",
             "active_embedding_profile": "TEXT DEFAULT ''",
             "embeddings_per_clip": "INTEGER DEFAULT 0",
         },
@@ -175,6 +178,22 @@ def _migrate(conn: sqlite3.Connection) -> None:
         for name, decl in columns.items():
             if name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
+def _infer_gif_flags(conn: sqlite3.Connection) -> None:
+    """Backfill the explicit GIF flag for movies created before the column existed."""
+    conn.execute(
+        """
+        UPDATE movies
+        SET was_gif = 1
+        WHERE was_gif = 0
+          AND (
+              lower(trim(original_name)) LIKE '%.gif'
+              OR lower(trim(filename)) LIKE '%.gif'
+              OR lower(trim(path)) LIKE '%.gif'
+          )
+        """
+    )
 
 
 def _sync_builtin_profiles(conn: sqlite3.Connection) -> None:
@@ -242,6 +261,8 @@ def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
                 data[key] = json.loads(data[key])
             except json.JSONDecodeError:
                 data[key] = []
+    if "was_gif" in data:
+        data["was_gif"] = bool(data["was_gif"])
     return data
 
 
@@ -262,19 +283,29 @@ def create_movie(
     collection_title: str = "",
     skip_clip_detection: bool = False,
     max_blind_clip_seconds: float = 20.0,
+    was_gif: bool = False,
 ) -> int:
+    # Keep this defensive fallback so every creation path remains correct even
+    # if a caller does not explicitly pass the flag. GIF uploads are converted
+    # to MP4 later, so the original name is the important source of truth.
+    was_gif = bool(was_gif) or any(
+        str(value or "").strip().lower().endswith(".gif")
+        for value in (original_name, filename, path)
+    )
     now = utc_now()
     with connect() as conn:
         cur = conn.execute(
             """
             INSERT INTO movies
                 (original_name, filename, path, checksum, duration, fps, width, height,
-                 collection_title, skip_clip_detection, max_blind_clip_seconds, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                collection_title, skip_clip_detection, max_blind_clip_seconds, was_gif,
+                created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 original_name, filename, str(path), checksum, duration, fps, width, height,
-                collection_title, int(bool(skip_clip_detection)), float(max_blind_clip_seconds), now, now,
+                collection_title, int(bool(skip_clip_detection)), float(max_blind_clip_seconds),
+                int(bool(was_gif)), now, now,
             ),
         )
         _bump_generation(conn, "clip_catalog")
@@ -289,7 +320,7 @@ def update_movie(movie_id: int, **fields: Any) -> None:
     values = list(fields.values()) + [movie_id]
     with connect() as conn:
         conn.execute(f"UPDATE movies SET {assignments} WHERE id = ?", values)
-        if set(fields).intersection({"original_name", "filename", "path", "collection_title"}):
+        if set(fields).intersection({"original_name", "filename", "path", "collection_title", "was_gif"}):
             _bump_generation(conn, "clip_catalog")
 
 
@@ -736,7 +767,8 @@ def list_clips(
     sql = """
         SELECT clips.*, aesthetic_scores.mean_score AS aesthetic_avg,
                movies.collection_title AS collection_title,
-               movies.original_name AS movie_original_name
+               movies.original_name AS movie_original_name,
+               movies.was_gif AS movie_was_gif
         FROM clips
         LEFT JOIN movies ON movies.id = clips.movie_id
         LEFT JOIN aesthetic_scores ON aesthetic_scores.clip_id = clips.id

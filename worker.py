@@ -504,6 +504,7 @@ def _catalog(req: CatalogReq) -> dict[str, Any]:
             ),
             "collection_title": str(row.get("collection_title") or ""),
             "original_name": str(row.get("movie_original_name") or ""),
+            "was_gif": bool(row.get("movie_was_gif")),
             "description": str(row.get("description") or ""),
             "shot_size": str(row.get("shot_size") or "unknown"),
             "camera_motion_type": str(row.get("camera_motion_type") or "unknown"),
@@ -1701,6 +1702,7 @@ async def upload_jobs(
                 collection_title=collection_title,
                 skip_clip_detection=skip_clip_detection,
                 max_blind_clip_seconds=max_blind_clip_seconds,
+                was_gif=suffix == ".gif",
             )
             source_url = f"local-upload:{original_name}"
             db.update_movie(

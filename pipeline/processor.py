@@ -156,6 +156,7 @@ def ingest_url(
         collection_title=collection_title,
         skip_clip_detection=skip_clip_detection,
         max_blind_clip_seconds=max_blind_clip_seconds,
+        was_gif=suffix == ".gif",
     )
     record_source_link(movie_id, parsed_name, collection_title, url, target, source_type="url")
     db.update_movie(
@@ -1173,6 +1174,7 @@ def _write_metadata(movie_id: int, clip_id: int, extra: dict | None = None) -> N
             "width": movie["width"],
             "height": movie["height"],
             "detector": movie["detector"],
+            "was_gif": bool(movie.get("was_gif")),
         },
         "clip": clip,
     }
