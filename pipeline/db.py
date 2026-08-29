@@ -191,6 +191,7 @@ def _infer_gif_flags(conn: sqlite3.Connection) -> None:
               lower(trim(original_name)) LIKE '%.gif'
               OR lower(trim(filename)) LIKE '%.gif'
               OR lower(trim(path)) LIKE '%.gif'
+              OR lower(trim(source_url)) LIKE '%.gif%'
           )
         """
     )

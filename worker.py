@@ -1680,6 +1680,7 @@ async def upload_jobs(
                     collection_title=collection_title,
                     skip_clip_detection=skip_clip_detection,
                     max_blind_clip_seconds=max_blind_clip_seconds,
+                    was_gif=suffix == ".gif" or bool(existing.get("was_gif")),
                 )
                 if autostart:
                     queue_movie_processing(int(existing["id"]))
