@@ -113,6 +113,9 @@ def convert_gif_to_mp4(source: Path, target: Path) -> Path:
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         # Ignore an infinite GIF loop and import the animation once.
         "-ignore_loop", "1", "-i", str(source),
+        # H.264 with yuv420p requires even dimensions. GIFs frequently have
+        # an odd height (for example 600x571), so reduce odd dimensions by one.
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
         "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
         "-movflags", "+faststart", str(target),
     ]
@@ -188,6 +191,8 @@ def export_clip(
             "-i", str(source),
             "-t", f"{duration:.3f}",
             "-map", "0:v:0", "-map", "0:a?",
+            # H.264/yuv420p cannot encode odd frame dimensions.
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
         ]
         if encoder == "h264_nvenc":
             cmd += ["-c:v", "h264_nvenc", "-preset", nvenc_preset, "-rc", "vbr", "-cq", str(nvenc_cq)]
