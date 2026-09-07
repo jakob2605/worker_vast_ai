@@ -18,7 +18,7 @@ Progress = Callable[[str, float], None]
 
 
 def remote_root() -> str:
-    return os.getenv("RCLONE_REMOTE", "gdrive:VastAIProgram").rstrip("/")
+    return os.getenv("RCLONE_REMOTE", "idrive:vastaibackup/VastAIProgram").rstrip("/")
 
 
 def rclone_ready() -> dict[str, Any]:
@@ -146,7 +146,7 @@ def create_snapshot(
         for index, folder in enumerate(included, start=1):
             source = LIBRARY_DIR / folder
             if source.exists():
-                update(f"Google Drive: {folder}", 0.1 + 0.85 * index / len(included))
+                update(f"Cloud storage: {folder}", 0.1 + 0.85 * index / len(included))
                 _run([
                     "copy",
                     str(source),
@@ -174,7 +174,7 @@ def create_snapshot(
                 _add_tree_to_zip(zf, LIBRARY_DIR / folder, folder)
 
         destination = f"{remote_root()}/snapshots/{snapshot_id}.zip"
-        update("Google Drive: Snapshot-Archiv", 0.9)
+        update("Cloud storage: snapshot archive", 0.9)
         _run(["copyto", str(archive), destination, "--checksum"])
         update("Snapshot complete", 1.0)
         return {"snapshot_id": snapshot_id, "remote": destination, "included": included, "archive": True}
@@ -187,7 +187,7 @@ def restore_snapshot(snapshot_id: str, *, progress: Progress | None = None) -> d
     snapshots = list_snapshots()
     if snapshot_id == "latest":
         if not snapshots:
-            raise RuntimeError("No Google Drive snapshots are available")
+            raise RuntimeError("No cloud snapshots are available")
         snapshot_id = snapshots[0]["id"]
     if not snapshot_id or any(char not in "0123456789TZ" for char in snapshot_id):
         raise ValueError("Invalid snapshot id")
@@ -197,27 +197,27 @@ def restore_snapshot(snapshot_id: str, *, progress: Progress | None = None) -> d
 
     snapshot_info = next((item for item in snapshots if item["id"] == snapshot_id), None)
     if snapshot_info is None:
-        raise RuntimeError(f"Google Drive snapshot not found: {snapshot_id}")
+        raise RuntimeError(f"Cloud snapshot not found: {snapshot_id}")
     is_archive = bool(snapshot_info.get("archive"))
 
     staging = LIBRARY_DIR.parent / f".{LIBRARY_DIR.name}.restore-{snapshot_id}"
     shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True, exist_ok=True)
     if progress:
-        progress("Google Drive snapshot wird geladen", 0.1)
+        progress("Cloud snapshot wird geladen", 0.1)
     archive = staging.parent / f".{LIBRARY_DIR.name}.restore-{snapshot_id}.zip"
     archive.unlink(missing_ok=True)
     try:
         if is_archive:
             if progress:
-                progress("Google Drive: Snapshot-Archiv wird geladen", 0.1)
+                progress("Cloud storage: Snapshot-Archiv wird geladen", 0.1)
             _run(["copyto", f"{remote_root()}/snapshots/{snapshot_id}.zip", str(archive), "--checksum"])
             if progress:
                 progress("Snapshot-Archiv wird entpackt", 0.5)
             _extract_zip_safely(archive, staging)
         else:
             if progress:
-                progress("Google Drive: Snapshot-Ordner wird kopiert", 0.1)
+                progress("Cloud storage: Snapshot-Ordner wird kopiert", 0.1)
             _run([
                 "copy",
                 f"{remote_root()}/snapshots/{snapshot_id}",

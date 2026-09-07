@@ -8,6 +8,7 @@ set -euo pipefail
 WORKER_DIR=/workspace/worker
 LIBRARY_DIR=${LIBRARY_DIR:-/workspace/library}
 PORT=${WORKER_PORT:-8100}
+RCLONE_REMOTE=${RCLONE_REMOTE:-idrive:vastaibackup/VastAIProgram}
 LOG=/workspace/worker.log
 
 echo "=== bootstrap $(date -u) ===" | tee -a "$LOG"
@@ -26,8 +27,8 @@ if [ -n "${RCLONE_CONFIG_B64:-}" ]; then
   chmod 600 ~/.config/rclone/rclone.conf
 
   # Test the remote (same command you ran manually)
-  if rclone lsd gdrive:VastAIProgram >/dev/null 2>&1; then
-    echo "rclone remote 'gdrive' is ready and can access VastAIProgram" | tee -a "$LOG"
+  if rclone lsd "$RCLONE_REMOTE" >/dev/null 2>&1; then
+    echo "rclone remote '$RCLONE_REMOTE' is ready" | tee -a "$LOG"
   else
     echo "WARNING: rclone remote test failed - check the config" | tee -a "$LOG"
   fi
@@ -130,7 +131,7 @@ if [ "${INSTALL_LANGUAGEBIND:-1}" != "0" ] && [ -x "$WORKER_DIR/bootstrap_langua
 fi
 
 if [ -n "${RESTORE_SNAPSHOT:-}" ]; then
-  echo "restoring Google Drive snapshot ${RESTORE_SNAPSHOT}" | tee -a "$LOG"
+  echo "restoring cloud snapshot ${RESTORE_SNAPSHOT}" | tee -a "$LOG"
   (cd "$WORKER_DIR" && "$PY" -m pipeline.cloud_backup restore "$RESTORE_SNAPSHOT") 2>&1 | tee -a "$LOG"
 fi
 

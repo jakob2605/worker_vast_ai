@@ -52,7 +52,7 @@ clone the worker code during bootstrap.
 | `SIGLIP_FP16` | on when CUDA | Half precision |
 | `LANGUAGEBIND_PYTHON` | `/workspace/venvs/languagebind/bin/python` | Isolated LanguageBind runtime |
 | `LANGUAGEBIND_REPO` | `/workspace/LanguageBind` | LanguageBind source checkout |
-| `RCLONE_REMOTE` | `gdrive:VastAIProgram` | Unencrypted Google Drive backup root |
+| `RCLONE_REMOTE` | `idrive:vastaibackup/VastAIProgram` | rclone cloud backup root; IDrive e2 example |
 | `RESTORE_SNAPSHOT` | *(unset)* | `latest` or snapshot id restored during bootstrap |
 
 ## API
@@ -69,7 +69,7 @@ POST /bundle                 zip of sqlite + metadata + embeddings (no video)
 GET  /embedding-profiles     profile registry and completeness
 POST /jobs/{id}/semantics    generate one selected profile non-destructively
 POST /embedding-profiles/{profile}/bundle  TikTokGen transfer bundle
-GET/POST /backups            Google Drive snapshots and restore jobs
+GET/POST /backups            Cloud snapshots and restore jobs
 POST /migrations             direct server-to-server migration via rclone/SFTP
 GET  /migrations/jobs/{id}   migration progress
 GET  /storage                disk used by movies/clips/frames/embeddings
