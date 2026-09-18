@@ -113,6 +113,20 @@ if [ -f "$WORKER_DIR/requirements.txt" ]; then
   fi
 fi
 
+# SAM2 itself is in requirements. Its model weights are intentionally fetched
+# separately: this makes the large download explicit and keeps restarts fast.
+if [ "${SAM2_ENABLED:-1}" != "0" ]; then
+  SAM2_CHECKPOINT="${SAM2_CHECKPOINT:-/workspace/checkpoints/sam2.1_hiera_large.pt}"
+  if [ ! -s "$SAM2_CHECKPOINT" ]; then
+    echo "downloading SAM2.1 large checkpoint" | tee -a "$LOG"
+    mkdir -p "$(dirname "$SAM2_CHECKPOINT")"
+    curl -fL --retry 3 -o "$SAM2_CHECKPOINT.tmp" \
+      "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt" >>"$LOG" 2>&1
+    mv "$SAM2_CHECKPOINT.tmp" "$SAM2_CHECKPOINT"
+  fi
+  export SAM2_CHECKPOINT
+fi
+
 # Bare 'uvicorn' is not always on PATH in these images; the module form always is.
 PY=$(command -v python3 || command -v python)
 echo "python: $PY" | tee -a "$LOG"
@@ -141,6 +155,7 @@ sleep 1
 cd "$WORKER_DIR"
 export LIBRARY_DIR
 export WORKER_TOKEN="${WORKER_TOKEN:-}"
+export SAM2_ENABLED="${SAM2_ENABLED:-1}"
 nohup "$PY" -m uvicorn worker:app --host 0.0.0.0 --port "$PORT" >>"$LOG" 2>&1 &
 
 echo "worker starting on :$PORT (library $LIBRARY_DIR)" | tee -a "$LOG"
