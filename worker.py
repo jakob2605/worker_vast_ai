@@ -19,6 +19,7 @@ import threading
 import time
 import zipfile
 import uuid
+import requests
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -248,38 +249,9 @@ _PIPELINE_EXECUTOR = ThreadPoolExecutor(
 )
 _PIPELINE_QUEUE_LOCK = threading.Lock()
 _QUEUED_MOVIES: set[int] = set()
-_SAM2_LOCK = threading.Lock()
-_SAM2_GENERATOR: Any | None = None
-
-
 class Sam2SegmentReq(BaseModel):
     clip_id: int
     frame_time: float = 0.0
-
-
-def _sam2_generator() -> Any:
-    """Load SAM2 once, lazily, so normal worker startup stays quick."""
-    global _SAM2_GENERATOR
-    with _SAM2_LOCK:
-        if _SAM2_GENERATOR is not None:
-            return _SAM2_GENERATOR
-        checkpoint = Path(os.getenv("SAM2_CHECKPOINT", "/workspace/checkpoints/sam2.1_hiera_large.pt"))
-        config_name = os.getenv("SAM2_CONFIG", "configs/sam2.1/sam2.1_hiera_l.yaml")
-        if not checkpoint.is_file():
-            raise HTTPException(503, "SAM2 checkpoint fehlt. Setze SAM2_CHECKPOINT auf dem Worker.")
-        try:
-            from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
-            from sam2.build_sam import build_sam2
-            model = build_sam2(config_name, str(checkpoint), device="cuda", apply_postprocessing=False)
-            _SAM2_GENERATOR = SAM2AutomaticMaskGenerator(
-                model, points_per_side=28, pred_iou_thresh=.82, stability_score_thresh=.90,
-                min_mask_region_area=900,
-            )
-        except ImportError as exc:
-            raise HTTPException(503, "SAM2 ist nicht installiert. Worker mit den neuen Requirements neu starten.") from exc
-        except Exception as exc:  # model/config/checkpoint errors are actionable to the client
-            raise HTTPException(503, f"SAM2 konnte nicht geladen werden: {exc}") from exc
-        return _SAM2_GENERATOR
 
 
 VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".gif"}
@@ -2056,49 +2028,23 @@ def clip_thumbnail(clip_id: int) -> FileResponse:
 
 @app.post("/sam2/segment", dependencies=[Depends(auth)])
 def sam2_segment(req: Sam2SegmentReq) -> dict[str, Any]:
-    """Return editable 1080x1920 SAM2 polygons for one precise clip frame."""
-    import cv2
-    import numpy as np
-    from PIL import Image, ImageOps
-
+    """Proxy a frame to the isolated local SAM2 process."""
     clip = db.get_clip(req.clip_id)
     if not clip:
         raise HTTPException(404, "Clip not found")
     source = _ensure_playable_clip_file(clip)
     if not source:
         raise HTTPException(404, "Clip file missing on disk")
-    capture = cv2.VideoCapture(str(source))
     try:
-        capture.set(cv2.CAP_PROP_POS_MSEC, max(0.0, req.frame_time) * 1000)
-        ok, frame = capture.read()
-    finally:
-        capture.release()
-    if not ok:
-        raise HTTPException(422, "Could not extract requested frame")
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    image = ImageOps.fit(Image.fromarray(rgb), (1080, 1920), method=Image.Resampling.LANCZOS)
-    arr = np.asarray(image)
-    masks = _sam2_generator().generate(arr)
-    editable: list[dict[str, Any]] = []
-    # Keep a useful, non-overlapping-ish set. Hundreds of tiny automatic masks
-    # make the editor unusable and do not help foreground selection.
-    for index, item in enumerate(sorted(masks, key=lambda value: float(value.get("area", 0)), reverse=True)):
-        if len(editable) >= 45:
-            break
-        binary = item.get("segmentation")
-        if binary is None:
-            continue
-        contours, _ = cv2.findContours(binary.astype("uint8"), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for contour in contours:
-            if cv2.contourArea(contour) < 900:
-                continue
-            epsilon = max(2.0, .004 * cv2.arcLength(contour, True))
-            polygon = cv2.approxPolyDP(contour, epsilon, True).reshape(-1, 2).tolist()
-            if len(polygon) >= 3:
-                editable.append({"id": f"{index}-{len(editable)}", "polygon": polygon, "score": round(float(item.get("predicted_iou", 0)), 3)})
-            if len(editable) >= 45:
-                break
-    return {"width": 1080, "height": 1920, "masks": editable}
+        response = requests.post(
+            os.getenv("SAM2_SERVICE_URL", "http://127.0.0.1:8101") + "/segment",
+            json={"source": str(source), "frame_time": max(0.0, req.frame_time)}, timeout=240,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(503, "SAM2 service is not running yet; restart the worker bootstrap.") from exc
+    if not response.ok:
+        raise HTTPException(503, f"SAM2 service failed: {response.text[:500]}")
+    return response.json()
 
 
 @app.post("/semantic-match", dependencies=[Depends(auth)])

@@ -98,6 +98,9 @@ ls -l "$WORKER_DIR" | tee -a "$LOG"
 
 # Python deps. torch ships with the vastai/pytorch image; never reinstall it,
 # a pip torch would likely be the CPU build and silently kill GPU throughput.
+# SAM2 belongs to its own virtual environment below. Remove an old accidental
+# main-environment install so it cannot pull a conflicting Torch on upgrades.
+pip uninstall -y SAM-2 >/dev/null 2>&1 || true
 if [ -f "$WORKER_DIR/requirements.txt" ]; then
   echo "installing python deps (this takes a few minutes)" | tee -a "$LOG"
   REQ_NO_TRANSNET=/tmp/worker-requirements-no-transnet.txt
@@ -113,18 +116,10 @@ if [ -f "$WORKER_DIR/requirements.txt" ]; then
   fi
 fi
 
-# SAM2 itself is in requirements. Its model weights are intentionally fetched
-# separately: this makes the large download explicit and keeps restarts fast.
-if [ "${SAM2_ENABLED:-1}" != "0" ]; then
-  SAM2_CHECKPOINT="${SAM2_CHECKPOINT:-/workspace/checkpoints/sam2.1_hiera_large.pt}"
-  if [ ! -s "$SAM2_CHECKPOINT" ]; then
-    echo "downloading SAM2.1 large checkpoint" | tee -a "$LOG"
-    mkdir -p "$(dirname "$SAM2_CHECKPOINT")"
-    curl -fL --retry 3 -o "$SAM2_CHECKPOINT.tmp" \
-      "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt" >>"$LOG" 2>&1
-    mv "$SAM2_CHECKPOINT.tmp" "$SAM2_CHECKPOINT"
-  fi
-  export SAM2_CHECKPOINT
+# SAM2 needs newer Torch than the intentionally stable media-worker stack.
+if [ "${SAM2_ENABLED:-1}" != "0" ] && [ -f "$WORKER_DIR/bootstrap_sam2.sh" ]; then
+  echo "starting isolated SAM2 runtime" | tee -a "$LOG"
+  WORKER_DIR="$WORKER_DIR" LIBRARY_DIR="$LIBRARY_DIR" bash "$WORKER_DIR/bootstrap_sam2.sh" >>/workspace/sam2-setup.log 2>&1
 fi
 
 # Bare 'uvicorn' is not always on PATH in these images; the module form always is.

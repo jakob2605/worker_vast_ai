@@ -16,5 +16,4 @@ scenedetect[opencv]
 transnetv2-pytorch
 # Installed from the official repository; the Vast PyTorch image already
 # supplies CUDA-enabled torch.
-git+https://github.com/facebookresearch/sam2.git
 # torch is preinstalled in the vastai/pytorch image - do not reinstall it there
