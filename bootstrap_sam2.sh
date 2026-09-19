@@ -12,7 +12,7 @@ PY=$(command -v python3 || command -v python)
 
 mkdir -p "$(dirname "$ENV_DIR")" "$(dirname "$CHECKPOINT")"
 if [ ! -x "$ENV_DIR/bin/python" ]; then "$PY" -m venv "$ENV_DIR"; fi
-"$ENV_DIR/bin/python" -m pip install --no-cache-dir --upgrade pip
+"$ENV_DIR/bin/python" -m pip install --no-cache-dir --upgrade pip setuptools wheel
 "$ENV_DIR/bin/python" -m pip install --no-cache-dir torch==2.5.1+cu121 torchvision==0.20.1+cu121 --index-url https://download.pytorch.org/whl/cu121
 SAM2_BUILD_CUDA=0 "$ENV_DIR/bin/python" -m pip install --no-cache-dir --no-deps --no-build-isolation git+https://github.com/facebookresearch/sam2.git
 "$ENV_DIR/bin/python" -m pip install --no-cache-dir fastapi 'uvicorn[standard]' numpy pillow opencv-python-headless hydra-core iopath omegaconf tqdm

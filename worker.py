@@ -254,6 +254,10 @@ class Sam2SegmentReq(BaseModel):
     frame_time: float = 0.0
 
 
+class Sam2PromptReq(Sam2SegmentReq):
+    point: list[float]
+
+
 VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".gif"}
 
 
@@ -2039,6 +2043,29 @@ def sam2_segment(req: Sam2SegmentReq) -> dict[str, Any]:
         response = requests.post(
             os.getenv("SAM2_SERVICE_URL", "http://127.0.0.1:8101") + "/segment",
             json={"source": str(source), "frame_time": max(0.0, req.frame_time)}, timeout=240,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(503, "SAM2 service is not running yet; restart the worker bootstrap.") from exc
+    if not response.ok:
+        raise HTTPException(503, f"SAM2 service failed: {response.text[:500]}")
+    return response.json()
+
+
+@app.post("/sam2/prompt", dependencies=[Depends(auth)])
+def sam2_prompt(req: Sam2PromptReq) -> dict[str, Any]:
+    """Proxy one explicit positive point prompt to the isolated SAM2 service."""
+    if len(req.point) != 2:
+        raise HTTPException(422, "point must contain exactly x and y")
+    clip = db.get_clip(req.clip_id)
+    if not clip:
+        raise HTTPException(404, "Clip not found")
+    source = _ensure_playable_clip_file(clip)
+    if not source:
+        raise HTTPException(404, "Clip file missing on disk")
+    try:
+        response = requests.post(
+            os.getenv("SAM2_SERVICE_URL", "http://127.0.0.1:8101") + "/prompt",
+            json={"source": str(source), "frame_time": max(0.0, req.frame_time), "point": req.point}, timeout=240,
         )
     except requests.RequestException as exc:
         raise HTTPException(503, "SAM2 service is not running yet; restart the worker bootstrap.") from exc
